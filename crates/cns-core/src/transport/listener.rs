@@ -4,6 +4,9 @@ use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::debug;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 /// 创建经过全链路高性能调优的 TCP 监听器
 pub fn create_tcp_listener(addr: SocketAddr, enable_tfo: bool) -> io::Result<TcpListener> {
     let domain = match addr {
@@ -30,10 +33,17 @@ pub fn create_tcp_listener(addr: SocketAddr, enable_tfo: bool) -> io::Result<Tcp
     // TCP Fast Open (0-RTT 握手)
     if enable_tfo {
         #[cfg(target_os = "linux")]
-        {
-            // 在 Linux 上队列长度推荐 1024
-            if let Err(e) = socket.set_tcp_fastopen(1024) {
-                warn!("Failed to enable TCP_FASTOPEN: {}. Continuing without TFO.", e);
+        unsafe {
+            let qlen: libc::c_int = 1024;
+            let ret = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &qlen as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&qlen) as libc::socklen_t,
+            );
+            if ret != 0 {
+                debug!("Failed to enable TCP_FASTOPEN via setsockopt");
             }
         }
     }
