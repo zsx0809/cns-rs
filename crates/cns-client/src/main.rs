@@ -1,6 +1,6 @@
 use clap::Parser;
 use cns_client::config::ClientConfig;
-use cns_client::inbound::{apply_process_gid, get_original_dst, Socks5Command, Socks5Handshake};
+use cns_client::inbound::{apply_process_gid, get_original_dst, LocalDnsRelay, Socks5Command, Socks5Handshake};
 use cns_client::outbound::CnsClientTunnel;
 use cns_core::crypto::CuteBiCipher;
 use cns_core::transport::{create_tcp_listener, tune_tcp_stream};
@@ -33,6 +33,10 @@ struct Args {
     /// Save PID to file (compatibility with legacy root scripts)
     #[arg(short = 'p', long = "pid-file")]
     pid_file: Option<String>,
+
+    /// Local UDP DNS relay listen address (e.g., 0.0.0.0:6653)
+    #[arg(long = "dns-listen", default_value = "0.0.0.0:6653")]
+    dns_listen: String,
 }
 
 #[tokio::main]
@@ -53,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Loading client configuration from: {}", args.config);
 
-    let mut config = match ClientConfig::from_file(&args.config) {
+    let config = match ClientConfig::from_file(&args.config) {
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to read {}: {}. Falling back to default client configuration.", args.config, e);
@@ -133,6 +137,18 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => warn!("Failed to bind IPv6 Transparent Proxy on {}: {}", v6_addr, e),
         }
+    }
+
+    // 3. 启动本地 UDP DNS 转发中继 (彻底解决手机端域名解析与免流断网问题)
+    if let Ok(dns_addr) = args.dns_listen.parse::<SocketAddr>() {
+        let cfg_dns = Arc::clone(&config_arc);
+        let cph_dns = Arc::clone(&cipher_arc);
+        tokio::spawn(async move {
+            if let Err(e) = LocalDnsRelay::run(dns_addr, cfg_dns, cph_dns).await {
+                warn!("Local DNS Relay error: {}", e);
+            }
+        });
+        info!("Local UDP DNS Relay listening on: {}", dns_addr);
     }
 
     info!("Upstream CNS Server: {}", config_arc.cns_server);

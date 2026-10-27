@@ -4,7 +4,7 @@ use cns_core::protocol::{HandshakeParser, SessionType};
 use cns_core::transport::{create_tcp_listener, tune_tcp_stream};
 use cns_server::config::Config;
 use cns_server::outbound::DirectOutbound;
-use cns_server::tunnel::{handle_dns_tcp_over_udp, pump_tcp_stream, UdpTunnel};
+use cns_server::tunnel::{handle_dns_tcp_over_udp, handle_http_dns, pump_tcp_stream, UdpTunnel};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -171,8 +171,12 @@ async fn handle_client(
                 &target_host,
                 cipher,
                 config.udp_timeout_duration(),
+                handshake.remaining_data,
             )
             .await?;
+        }
+        SessionType::HttpDns { domain, is_ipv6 } => {
+            handle_http_dns(stream, &domain, is_ipv6).await?;
         }
     }
 

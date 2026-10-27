@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# cns-rs 现代化透明代理调度脚本 (零 TUN 虚拟网卡开销，极速 NAT REDIRECT 架构)
+# cns-rs 现代化透明代理调度脚本 (NAT REDIRECT 架构 + DNS 智能中继)
 
 DIR="${0%/*}"
 cd "$DIR"
@@ -20,19 +20,17 @@ ipts() {
     ip6tables -w $@ 2>/dev/null
 }
 
-# 启动客户端与 iptables 规则
 start_rules() {
     stop_rules >/dev/null 2>&1
 
-    # 1. 启动 Rust 现代化客户端
     CONF="../modes/${modeName}.json"
     if [ ! -f "$CONF" ]; then
         echo "❌ 找不到配置文件: $CONF"
         return 1
     fi
 
-    echo "🚀 启动 cns-client 核心 (端口: $tproxy_port)..."
-    nohup ./cns-client -c "$CONF" -g 3004 -t "$tproxy_port" -p client.pid >/dev/null 2>&1 &
+    echo "🚀 启动 cns-client 核心 (TCP代理: $tproxy_port, DNS中继: 6653)..."
+    nohup ./cns-client -c "$CONF" -g 3004 -t "$tproxy_port" --dns-listen "0.0.0.0:6653" -p client.pid >/dev/null 2>&1 &
     sleep 1
 
     PID=$(cat client.pid 2>/dev/null)
@@ -42,49 +40,47 @@ start_rules() {
     fi
     echo "✓ cns-client 已就绪 (PID: $PID, GID: 3004)"
 
-    # 2. 注入高效 Linux NAT 转发规则
-    echo "⚙️ 注入现代透明代理网络规则..."
+    echo "⚙️ 注入现代透明代理网络规则与 DNS 智能劫持..."
     ipts -t nat -N CNS_TCP
     ipts -t nat -F CNS_TCP
 
-    # 核心防回环白名单：
-    # A. 放行客户端进程 GID 3004
+    # 1. 核心防回环白名单
     ipts -t nat -A CNS_TCP -m owner --gid-owner 3004 -j RETURN
-
-    # B. 放行直连 CNS 服务端端口 (13872) 与 本地透明代理端口，物理级杜绝自回环
     ipts -t nat -A CNS_TCP -p tcp --dport 13872 -j RETURN
     ipts -t nat -A CNS_TCP -p tcp --dport "$tproxy_port" -j RETURN
+    ipts -t nat -A CNS_TCP -p udp --dport 6653 -j RETURN
 
-    # C. 放行本地回环
+    # 2. 基础放行
     ipts -t nat -A CNS_TCP -o lo -j RETURN
-
-    # D. 放行 DHCP
     ipts -t nat -A CNS_TCP -p udp --dport 67:68 -j RETURN
 
-    # E. 放行 WiFi (按需)
+    # 3. 放行 WiFi (按需)
     if [ "$allowWifi" = "1" ]; then
         ipts -t nat -A CNS_TCP -o wlan+ -j RETURN
     fi
 
-    # F. 放行用户自定义应用 UID
+    # 4. 放行指定应用 UID
     if [ -n "$allowApps" ]; then
         for app in $allowApps; do
             ipts -t nat -A CNS_TCP -m owner --uid-owner "$app" -j RETURN
         done
     fi
 
-    # G. TCP 全流量重定向到 cns-client 独立端口
+    # 5. DNS 拦截：将所有 UDP 53 端口重定向到本地 6653
+    iptables -t nat -A CNS_TCP -p udp --dport 53 -j REDIRECT --to-ports 6653
+    ip6tables -t nat -A CNS_TCP -p udp --dport 53 -j REDIRECT --to-ports 6653 2>/dev/null
+
+    # 6. TCP 全流量重定向到 cns-client 端口
     iptables -t nat -A CNS_TCP -p tcp -j REDIRECT --to-ports "$tproxy_port"
     ip6tables -t nat -A CNS_TCP -p tcp -j REDIRECT --to-ports "$tproxy_port" 2>/dev/null
 
     # 挂载到系统 OUTPUT 链
     ipts -t nat -I OUTPUT -j CNS_TCP
 
-    echo "✓ 现代化免流隧道已开启！"
+    echo "✓ 现代化免流隧道与 DNS 已成功开启！"
     status_check
 }
 
-# 清理并停止
 stop_rules() {
     echo "🛑 正在关闭免流模式..."
     while ipts -t nat -D OUTPUT -j CNS_TCP; do :; done
@@ -99,7 +95,6 @@ stop_rules() {
     echo "✓ 免流模式已完全关闭，网络恢复直连。"
 }
 
-# 状态检测
 status_check() {
     echo "═════════════════════════════════════"
     PID=$(cat client.pid 2>/dev/null)
@@ -107,7 +102,8 @@ status_check() {
         RSS=$(grep -i VmRSS "/proc/$PID/status" 2>/dev/null | awk '{print $2, $3}')
         echo "● 状态: ✓ cns-client [Rust Edition] 正在运行"
         echo "● 模式: $modeName"
-        echo "● 端口: $tproxy_port"
+        echo "● TCP代理端口: $tproxy_port"
+        echo "● DNS中继端口: 6653"
         echo "● PID : $PID"
         echo "● 内存常驻 (RSS): ${RSS:-4.2 MB} (极度省电)"
     else
