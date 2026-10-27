@@ -1,2 +1,8 @@
 /target
 Cargo.lock
+
+# Private mode configs
+android-module/modes/美国.json
+android-module/modes/英国.json
+*.secret.json
+

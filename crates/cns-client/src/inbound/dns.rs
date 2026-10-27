@@ -5,7 +5,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -55,21 +55,22 @@ impl LocalDnsRelay {
         let mut ctrl_buf = [0u8; 512];
 
         loop {
-            // 等待套接字可读
-            if let Err(e) = socket.readable().await {
-                warn!("DNS relay readable error: {}", e);
-                continue;
-            }
-
-            // 尝试读取带控制信息的数据包
+            // 使用 try_io 驱动底层 libc recvmsg，由 Tokio 自动维护 epoll 就绪标志，绝无死循环空转
             let raw_fd = socket.as_raw_fd();
-            let recv_res = recv_packet_with_orig_dst(raw_fd, &mut buf, &mut ctrl_buf);
+            let recv_res = socket.try_io(Interest::READABLE, || {
+                recv_packet_with_orig_dst(raw_fd, &mut buf, &mut ctrl_buf)
+            });
 
             let (len, peer, orig_dst) = match recv_res {
-                Ok(Some(res)) => res,
-                Ok(None) => continue, // WouldBlock
+                Ok(res) => res,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = socket.readable().await {
+                        warn!("DNS relay readable wait error: {}", e);
+                    }
+                    continue;
+                }
                 Err(e) => {
-                    warn!("DNS recvmsg error: {}", e);
+                    warn!("DNS recv error: {}", e);
                     continue;
                 }
             };
@@ -272,7 +273,7 @@ fn recv_packet_with_orig_dst(
     raw_fd: std::os::unix::io::RawFd,
     buf: &mut [u8],
     ctrl_buf: &mut [u8],
-) -> io::Result<Option<(usize, SocketAddr, SocketAddr)>> {
+) -> io::Result<(usize, SocketAddr, SocketAddr)> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let mut iov = libc::iovec {
@@ -294,11 +295,7 @@ fn recv_packet_with_orig_dst(
 
         let n = unsafe { libc::recvmsg(raw_fd, &mut msghdr, libc::MSG_DONTWAIT) };
         if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
-            }
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
 
         let peer_ip = Ipv4Addr::from(src_addr.sin_addr.s_addr.to_ne_bytes());
@@ -309,7 +306,7 @@ fn recv_packet_with_orig_dst(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53))
         });
 
-        Ok(Some((n as usize, peer, orig_dst)))
+        Ok((n as usize, peer, orig_dst))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
