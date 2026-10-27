@@ -49,7 +49,7 @@ pub async fn handle_http_dns(
     Ok(())
 }
 
-/// 强化版 DNS TCP-over-UDP 处理 (支持首包粘包数据)
+/// 强化版 DNS TCP-over-UDP 处理 (支持双上游极速竞速与抗丢包)
 pub async fn handle_dns_tcp_over_udp(
     mut client: TcpStream,
     dns_server: &str,
@@ -102,17 +102,8 @@ pub async fn handle_dns_tcp_over_udp(
         cipher.crypt_in_place(&mut query_payload, 2);
     }
 
-    // 通过本地 UDP Socket 向远端目标 DNS 发送
-    let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
-    timeout(timeout_duration, udp_socket.send_to(&query_payload, dns_server))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS send timed out"))??;
-
-    // 接收远端 DNS 响应
-    let mut resp_buf = vec![0u8; 4096];
-    let (resp_len, _) = timeout(timeout_duration, udp_socket.recv_from(&mut resp_buf))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS recv timed out"))??;
+    // 执行双上游竞速查询 (8.8.8.8 与 1.1.1.1 毫秒级先到先得)
+    let (resp_len, resp_buf) = query_upstream_dns(&query_payload, dns_server, timeout_duration).await?;
 
     // 组装回传报文：[2 字节大端序长度] + [DNS 响应报文]
     let mut out_buf = Vec::with_capacity(2 + resp_len);
@@ -129,4 +120,51 @@ pub async fn handle_dns_tcp_over_udp(
 
     debug!("DNS query successfully answered: {} bytes", resp_len);
     Ok(())
+}
+
+/// 双上游 DNS 并发竞速解析，消除单点抖动并大幅降低解析延迟
+async fn query_upstream_dns(
+    query: &[u8],
+    primary_server: &str,
+    timeout_duration: Duration,
+) -> io::Result<(usize, Vec<u8>)> {
+    let backup_server = if primary_server != "1.1.1.1:53" {
+        "1.1.1.1:53"
+    } else {
+        "8.8.4.4:53"
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+    let q1 = query.to_vec();
+    let p_srv = primary_server.to_string();
+    let tx1 = tx.clone();
+    tokio::spawn(async move {
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await {
+            if socket.send_to(&q1, &p_srv).await.is_ok() {
+                let mut buf = vec![0u8; 4096];
+                if let Ok((n, _)) = socket.recv_from(&mut buf).await {
+                    let _ = tx1.send((n, buf)).await;
+                }
+            }
+        }
+    });
+
+    let q2 = query.to_vec();
+    let b_srv = backup_server.to_string();
+    tokio::spawn(async move {
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await {
+            if socket.send_to(&q2, &b_srv).await.is_ok() {
+                let mut buf = vec![0u8; 4096];
+                if let Ok((n, _)) = socket.recv_from(&mut buf).await {
+                    let _ = tx.send((n, buf)).await;
+                }
+            }
+        }
+    });
+
+    timeout(timeout_duration, rx.recv())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Upstream DNS timed out"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Upstream DNS all failed"))
 }

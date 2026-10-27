@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 /// 本地 DNS 代理服务器：接收本地 UDP DNS 请求，包装成 tcpDNS 走免流隧道向 CNS 服务端查询
 /// 并利用 IP_RECVORIGDSTADDR 精确捕获原始目的 IP，回包时通过 Raw Socket 动态伪造源 IP
+/// 同时在本地毫秒级过滤 AAAA (IPv6) 请求，解决双栈 CDN (如 GitHub Assets) 白底黑字与 IPv6 直连漏免问题
 pub struct LocalDnsRelay;
 
 impl LocalDnsRelay {
@@ -76,6 +77,20 @@ impl LocalDnsRelay {
             };
 
             let query = buf[..len].to_vec();
+
+            // 智能拦截 AAAA (IPv6) 查询，直接本地秒回 NODATA 响应
+            // 促使浏览器 / APP 毫秒级回退至纯 IPv4 走免流隧道，彻底消灭双栈 CDN 白底黑字
+            if let Some(nodata_resp) = build_aaaa_nodata_response(&query) {
+                let sock_clone = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    if let Err(e) = Self::send_raw_dns_reply(peer, orig_dst, &nodata_resp) {
+                        let _ = sock_clone.send_to(&nodata_resp, peer).await;
+                        debug!("AAAA NODATA raw reply fallback to udp: {}", e);
+                    }
+                });
+                continue;
+            }
+
             let sock_clone = Arc::clone(&socket);
             let cfg_clone = Arc::clone(&config);
             let cph_clone = Arc::clone(&cipher);
@@ -266,6 +281,58 @@ impl LocalDnsRelay {
         }
         Err(io::Error::new(io::ErrorKind::Other, "Raw socket unsupported or IPv6"))
     }
+}
+
+/// 检查是否为 AAAA (IPv6) 查询，若是则直接返回标准权威 NODATA 响应 (RCODE=0, ANCOUNT=0)
+fn build_aaaa_nodata_response(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    // 检查 QDCOUNT == 1
+    let qdcount = u16::from_be_bytes([query[4], query[5]]);
+    if qdcount != 1 {
+        return None;
+    }
+    // 跳过 Header (12 字节)，遍历 QNAME
+    let mut offset = 12;
+    while offset < query.len() {
+        let len = query[offset] as usize;
+        if len == 0 {
+            offset += 1;
+            break;
+        }
+        // 如果是压缩指针
+        if (len & 0xc0) == 0xc0 {
+            offset += 2;
+            break;
+        }
+        offset += 1 + len;
+    }
+
+    // 此时 offset 应该指向 QTYPE (2 字节)
+    if offset + 4 <= query.len() {
+        let qtype = u16::from_be_bytes([query[offset], query[offset + 1]]);
+        if qtype == 28 { // 28 即 AAAA (IPv6)
+            let question_end = offset + 4;
+            let mut resp = Vec::with_capacity(question_end);
+            // 1. Transaction ID (原样复制)
+            resp.extend_from_slice(&query[0..2]);
+            // 2. Flags: 0x8180 (标准响应, No Error, Recursion Available)
+            resp.extend_from_slice(&[0x81, 0x80]);
+            // 3. QDCOUNT: 1
+            resp.extend_from_slice(&[0x00, 0x01]);
+            // 4. ANCOUNT: 0 (权威空结果，表示该域名无 IPv6 记录)
+            resp.extend_from_slice(&[0x00, 0x00]);
+            // 5. NSCOUNT: 0
+            resp.extend_from_slice(&[0x00, 0x00]);
+            // 6. ARCOUNT: 0
+            resp.extend_from_slice(&[0x00, 0x00]);
+            // 7. Question Section 原样保留
+            resp.extend_from_slice(&query[12..question_end]);
+            return Some(resp);
+        }
+    }
+    None
 }
 
 /// 使用 libc::recvmsg 接收数据包并解析控制消息以提取原目标地址
