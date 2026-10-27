@@ -30,6 +30,38 @@ pub fn create_tcp_listener(addr: SocketAddr, enable_tfo: bool) -> io::Result<Tcp
         }
     }
 
+    // IP_TRANSPARENT 原生透明代理支持 (Linux/Android)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        let one: libc::c_int = 1;
+        match addr {
+            SocketAddr::V4(_) => {
+                let ret = libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_IP,
+                    libc::IP_TRANSPARENT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+                if ret == 0 {
+                    debug!("IPv4 IP_TRANSPARENT enabled successfully");
+                }
+            }
+            SocketAddr::V6(_) => {
+                let ret = libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IPV6,
+                    75, // IPV6_TRANSPARENT
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+                if ret == 0 {
+                    debug!("IPv6 IPV6_TRANSPARENT enabled successfully");
+                }
+            }
+        }
+    }
+
     // TCP Fast Open (0-RTT 握手)
     if enable_tfo {
         #[cfg(any(target_os = "linux", target_os = "android"))]

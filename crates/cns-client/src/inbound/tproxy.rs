@@ -5,13 +5,21 @@ use tokio::net::TcpStream;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::io::AsRawFd;
 
-/// 获取经过 Linux / Android iptables REDIRECT / TPROXY 劫持前的真实目标地址 (SO_ORIGINAL_DST)
-pub fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
+/// 获取经过 Linux / Android iptables TPROXY / REDIRECT 劫持前的真实目标地址
+pub fn get_original_dst(stream: &TcpStream, listen_port: u16) -> io::Result<SocketAddr> {
+    // 1. TPROXY 模式原生判断：开启 IP_TRANSPARENT 后，stream 的 local_addr 即为真实目标地址！
+    if let Ok(local) = stream.local_addr() {
+        if local.port() != listen_port {
+            return Ok(local);
+        }
+    }
+
+    // 2. REDIRECT 模式回退判断：调用 SO_ORIGINAL_DST
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let fd = stream.as_raw_fd();
 
-        // 1. 尝试获取 IPv4 原始目标 (SOL_IP, SO_ORIGINAL_DST = 80)
+        // 尝试获取 IPv4 原始目标 (SOL_IP, SO_ORIGINAL_DST = 80)
         unsafe {
             let mut addr: libc::sockaddr_in = std::mem::zeroed();
             let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
@@ -28,7 +36,7 @@ pub fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
                 return Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port));
             }
 
-            // 2. 尝试获取 IPv6 原始目标 (SOL_IPV6, IP6T_SO_ORIGINAL_DST = 80)
+            // 尝试获取 IPv6 原始目标 (SOL_IPV6, IP6T_SO_ORIGINAL_DST = 80)
             let mut addr6: libc::sockaddr_in6 = std::mem::zeroed();
             let mut len6 = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
             let ret6 = libc::getsockopt(
@@ -46,8 +54,7 @@ pub fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
         }
     }
 
-    // 非 Linux/Android 或未被 REDIRECT 劫持时，回退到对端地址
-    tracing::warn!("SO_ORIGINAL_DST failed or not redirected, fallback to peer_addr");
+    // 未被 TPROXY/REDIRECT 劫持时，回退到对端地址
     stream.peer_addr()
 }
 

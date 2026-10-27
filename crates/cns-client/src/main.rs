@@ -117,9 +117,9 @@ async fn main() -> anyhow::Result<()> {
         let cph_v4 = Arc::clone(&cipher_arc);
         match create_tcp_listener(v4_addr, cfg_v4.enable_tfo) {
             Ok(listener) => {
-                info!("Transparent Proxy (IPv4 REDIRECT) listening on: {}", v4_addr);
+                info!("Transparent Proxy (IPv4 TPROXY/REDIRECT) listening on: {}", v4_addr);
                 tokio::spawn(async move {
-                    run_tproxy_listener(listener, cfg_v4, cph_v4).await;
+                    run_tproxy_listener(listener, port, cfg_v4, cph_v4).await;
                 });
             }
             Err(e) => warn!("Failed to bind IPv4 Transparent Proxy on {}: {}", v4_addr, e),
@@ -130,9 +130,9 @@ async fn main() -> anyhow::Result<()> {
         let cph_v6 = Arc::clone(&cipher_arc);
         match create_tcp_listener(v6_addr, cfg_v6.enable_tfo) {
             Ok(listener) => {
-                info!("Transparent Proxy (IPv6 REDIRECT) listening on: {}", v6_addr);
+                info!("Transparent Proxy (IPv6 TPROXY/REDIRECT) listening on: {}", v6_addr);
                 tokio::spawn(async move {
-                    run_tproxy_listener(listener, cfg_v6, cph_v6).await;
+                    run_tproxy_listener(listener, port, cfg_v6, cph_v6).await;
                 });
             }
             Err(e) => warn!("Failed to bind IPv6 Transparent Proxy on {}: {}", v6_addr, e),
@@ -201,6 +201,7 @@ async fn run_socks5_listener(
 
 async fn run_tproxy_listener(
     listener: TcpListener,
+    listen_port: u16,
     config: Arc<ClientConfig>,
     cipher: Arc<CuteBiCipher>,
 ) {
@@ -212,7 +213,7 @@ async fn run_tproxy_listener(
                 let cph = Arc::clone(&cipher);
 
                 tokio::spawn(async move {
-                    match get_original_dst(&stream) {
+                    match get_original_dst(&stream, listen_port) {
                         Ok(target_addr) => {
                             let target_host = target_addr.to_string();
                             info!("TProxy intercepted connection to [{}] from [{}]", target_host, peer_addr);
@@ -221,7 +222,7 @@ async fn run_tproxy_listener(
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to get SO_ORIGINAL_DST from [{}]: {}", peer_addr, e);
+                            warn!("Failed to get original dst from [{}]: {}", peer_addr, e);
                         }
                     }
                 });
