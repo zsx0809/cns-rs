@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# cns-rs 现代化免流透明代理调度脚本 (原生 Micro-TUN 引擎 + 全协议连通性检测)
+# cns-rs 现代化免流透明代理调度脚本 (NAT REDIRECT 架构 + DNS 智能中继 + 全协议连通性检测)
 
 DIR="${0%/*}"
 cd "$DIR"
@@ -15,10 +15,8 @@ fi
 
 modeName="${modeName:-美国}"
 tproxy_port="${tproxy_port:-7750}"
+DNS_PORT="7753"
 allowWifi="${allowWifi:-1}"
-FWMARK="999"
-TABLE="101"
-TUN_DEV="tunDev"
 
 ipts() {
     iptables -w $@ 2>/dev/null
@@ -34,8 +32,8 @@ start_rules() {
         return 1
     fi
 
-    echo "🚀 启动 cns-client 核心 (Micro-TUN: $TUN_DEV, GID: 3004)..."
-    ./cns-client -c "$CONF" -g 3004 --tun "$TUN_DEV" -t "$tproxy_port" -p client.pid > client.log 2>&1 &
+    echo "🚀 启动 cns-client 核心 (TCP: $tproxy_port, DNS: $DNS_PORT, GID: 3004)..."
+    ./cns-client -c "$CONF" -g 3004 -t "$tproxy_port" --dns-listen "0.0.0.0:$DNS_PORT" -p client.pid > client.log 2>&1 &
     sleep 1
 
     PID=$(cat client.pid 2>/dev/null)
@@ -46,58 +44,45 @@ start_rules() {
     fi
     echo "✓ cns-client 已就绪 (PID: $PID, GID: 3004)"
 
-    echo "⚙️ 配置虚拟网络设备与策略路由..."
-    # 1. 激活 TUN 虚拟网卡
-    ip addr add 10.0.0.1/32 dev "$TUN_DEV" 2>/dev/null
-    ip link set dev "$TUN_DEV" mtu 1350 2>/dev/null
-    ip link set dev "$TUN_DEV" up 2>/dev/null
-
-    # IPv6 网卡配置
-    ip -6 addr add fec0::1/64 dev "$TUN_DEV" 2>/dev/null
-    ip -6 link set dev "$TUN_DEV" up 2>/dev/null
-
-    # 2. 路由表 101：默认路由全部走 tunDev
-    ip route add default dev "$TUN_DEV" table $TABLE 2>/dev/null
-    ip -6 route add default dev "$TUN_DEV" table $TABLE 2>/dev/null
-
-    # 3. 策略路由：fwmark 999 走 table 101 (优先级 99，高于 Android 所有策略路由)
-    ip rule add fwmark $FWMARK lookup $TABLE pref 99 2>/dev/null
-    ip -6 rule add fwmark $FWMARK lookup $TABLE pref 99 2>/dev/null
-
     echo "⚙️ 注入内核数据包分流与防回环规则..."
-    # 4. iptables mangle 规则：为非 GID 3004 流量打上 mark 999
     for tool in iptables ip6tables; do
-        $tool -w -t mangle -N CNS_OUT 2>/dev/null
-        $tool -w -t mangle -F CNS_OUT
+        $tool -w -t nat -N CNS_NAT 2>/dev/null
+        $tool -w -t nat -F CNS_NAT
 
-        # 核心防回环
-        $tool -w -t mangle -A CNS_OUT -m owner --gid-owner 3004 -j RETURN
-        $tool -w -t mangle -A CNS_OUT -o lo -j RETURN
-        $tool -w -t mangle -A CNS_OUT -o tun+ -j RETURN
-        $tool -w -t mangle -A CNS_OUT -p udp --dport 67:68 -j RETURN
+        # 1. 防回环白名单
+        $tool -w -t nat -A CNS_NAT -m owner --gid-owner 3004 -j RETURN
+        $tool -w -t nat -A CNS_NAT -o lo -j RETURN
+        $tool -w -t nat -A CNS_NAT -p udp --dport 67:68 -j RETURN
 
-        # WiFi 放行
+        # 2. 放行 CNS 服务端端口 (直连不走代理)
+        $tool -w -t nat -A CNS_NAT -p tcp --dport 13872 -j RETURN
+
+        # 3. 放行代理自身监听端口
+        $tool -w -t nat -A CNS_NAT -p tcp --dport "$tproxy_port" -j RETURN
+        $tool -w -t nat -A CNS_NAT -p udp --dport "$DNS_PORT" -j RETURN
+
+        # 4. WiFi 放行
         if [ "$allowWifi" = "1" ]; then
-            $tool -w -t mangle -A CNS_OUT -o wlan+ -j RETURN
+            $tool -w -t nat -A CNS_NAT -o wlan+ -j RETURN
         fi
 
-        # 放行指定应用 UID
+        # 5. 放行指定应用 UID
         if [ -n "$allowApps" ]; then
             for app in $allowApps; do
-                $tool -w -t mangle -A CNS_OUT -m owner --uid-owner "$app" -j RETURN
+                $tool -w -t nat -A CNS_NAT -m owner --uid-owner "$app" -j RETURN
             done
         fi
 
-        # 放行 CNS 服务端端口 (直连不走代理)
-        $tool -w -t mangle -A CNS_OUT -p tcp --dport 13872 -j RETURN
+        # 6. DNS 拦截：将所有 UDP 53 端口重定向到本地 DNS 中继端口 7753
+        $tool -w -t nat -A CNS_NAT -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
 
-        # 将其它所有流量全部打标 999 导向 Micro-TUN
-        $tool -w -t mangle -A CNS_OUT -j MARK --set-mark $FWMARK
+        # 7. TCP 全流量重定向到 cns-client 端口 7750
+        $tool -w -t nat -A CNS_NAT -p tcp -j REDIRECT --to-ports "$tproxy_port"
 
-        $tool -w -t mangle -I OUTPUT -j CNS_OUT
+        $tool -w -t nat -I OUTPUT -j CNS_NAT
     done
 
-    echo "✓ 现代化免流隧道与 Micro-TUN 已完全就绪！"
+    echo "✓ 现代化免流隧道与 DNS 智能中继已完全就绪！"
     status_check
     echo ""
     run_tests
@@ -106,17 +91,10 @@ start_rules() {
 stop_rules() {
     echo "🛑 正在关闭免流模式..."
     for tool in iptables ip6tables; do
-        while $tool -w -t mangle -D OUTPUT -j CNS_OUT 2>/dev/null; do :; done
-        $tool -w -t mangle -F CNS_OUT 2>/dev/null
-        $tool -w -t mangle -X CNS_OUT 2>/dev/null
+        while $tool -w -t nat -D OUTPUT -j CNS_NAT 2>/dev/null; do :; done
+        $tool -w -t nat -F CNS_NAT 2>/dev/null
+        $tool -w -t nat -X CNS_NAT 2>/dev/null
     done
-
-    while ip rule del fwmark $FWMARK lookup $TABLE 2>/dev/null; do :; done
-    ip route flush table $TABLE 2>/dev/null
-    while ip -6 rule del fwmark $FWMARK lookup $TABLE 2>/dev/null; do :; done
-    ip -6 route flush table $TABLE 2>/dev/null
-
-    ip link set dev "$TUN_DEV" down 2>/dev/null
 
     PID=$(cat client.pid 2>/dev/null)
     if [ -n "$PID" ]; then
@@ -133,7 +111,8 @@ status_check() {
         RSS=$(grep -i VmRSS "/proc/$PID/status" 2>/dev/null | awk '{print $2, $3}')
         echo "● 状态: ✓ cns-client [Rust Edition] 正在运行"
         echo "● 模式: $modeName"
-        echo "● 虚拟网卡: $TUN_DEV"
+        echo "● TCP 端口: $tproxy_port"
+        echo "● DNS 端口: $DNS_PORT"
         echo "● PID : $PID"
         echo "● 内存常驻 (RSS): ${RSS:-3.5 MB} (极度省电)"
     else
@@ -209,7 +188,7 @@ run_tests() {
         UDP_PASS="1"
     fi
     if [ "$UDP_PASS" = "1" ]; then
-        echo "✓ 成功! Micro-TUN UDP 隧道吞吐畅通"
+        echo "✓ 成功! UDP 隧道吞吐畅通"
     else
         echo "× 失败 (UDP 数据链路阻断)"
     fi

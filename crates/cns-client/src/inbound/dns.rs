@@ -116,66 +116,10 @@ impl LocalDnsRelay {
             cipher.crypt_in_place(&mut dns_resp_body, 2);
         }
 
-        // 6. 将真实的 DNS 响应发回给手机应用 (优先通过 IP_TRANSPARENT 精确伪装 53 端口源地址)
-        if Self::reply_dns(peer, &dns_resp_body).is_err() {
-            let _ = socket.send_to(&dns_resp_body, peer).await;
-        }
+        // 6. 将真实的 DNS 响应发回给手机应用 (内核 NAT conntrack 会自动反向还原源地址和53端口)
+        socket.send_to(&dns_resp_body, peer).await?;
         debug!("DNS query resolved via CNS for [{}] ({} bytes)", peer, resp_pkg_len);
 
         Ok(())
-    }
-
-    /// 使用 Linux/Android 原生 IP_TRANSPARENT 以标准 53 端口回复客户端，彻底解决移动端解析丢包
-    fn reply_dns(peer: SocketAddr, resp: &[u8]) -> io::Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            use socket2::{Domain, Protocol, Socket, Type};
-            use std::os::unix::io::AsRawFd;
-
-            let orig_dns: SocketAddr = match peer {
-                SocketAddr::V4(_) => "8.8.8.8:53".parse().unwrap(),
-                SocketAddr::V6(_) => "[2001:4860:4860::8888]:53".parse().unwrap(),
-            };
-
-            let domain = match orig_dns {
-                SocketAddr::V4(_) => Domain::IPV4,
-                SocketAddr::V6(_) => Domain::IPV6,
-            };
-
-            if let Ok(reply_sock) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) {
-                let _ = reply_sock.set_reuse_address(true);
-                let one: libc::c_int = 1;
-                unsafe {
-                    match orig_dns {
-                        SocketAddr::V4(_) => {
-                            let _ = libc::setsockopt(
-                                reply_sock.as_raw_fd(),
-                                libc::SOL_IP,
-                                libc::IP_TRANSPARENT,
-                                &one as *const _ as *const libc::c_void,
-                                std::mem::size_of_val(&one) as libc::socklen_t,
-                            );
-                        }
-                        SocketAddr::V6(_) => {
-                            let _ = libc::setsockopt(
-                                reply_sock.as_raw_fd(),
-                                libc::IPPROTO_IPV6,
-                                75, // IPV6_TRANSPARENT
-                                &one as *const _ as *const libc::c_void,
-                                std::mem::size_of_val(&one) as libc::socklen_t,
-                            );
-                        }
-                    }
-                }
-
-                if reply_sock.bind(&orig_dns.into()).is_ok() {
-                    let std_sock: std::net::UdpSocket = reply_sock.into();
-                    if std_sock.send_to(resp, peer).is_ok() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        Err(io::Error::new(io::ErrorKind::Other, "fallback to direct socket"))
     }
 }
