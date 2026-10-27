@@ -98,30 +98,9 @@ pub async fn pump_tcp_stream(
         let _ = c_write.shutdown().await;
         Ok::<(), io::Error>(())
     };
-                pass_sub = server_cipher.crypt_in_place(&mut buf[..n], pass_sub);
-            }
 
-            timeout(tcp_timeout, c_write.write_all(&buf[..n]))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "s2c write timed out"))??;
-        }
-        let _ = c_write.shutdown().await;
-        Ok::<(), io::Error>(())
-    };
-
-    // 任意一侧结束即完成双向协同清理
-    tokio::select! {
-        res = c2s => {
-            if let Err(e) = res {
-                debug!("TCP c2s stream closed: {}", e);
-            }
-        }
-        res = s2c => {
-            if let Err(e) = res {
-                debug!("TCP s2c stream closed: {}", e);
-            }
-        }
-    }
+    // 双向流独立协同传输，支持 TCP 半关闭 (Half-Close)，绝不因单向 EOF 强行掐断另一向数据
+    let _ = tokio::try_join!(c2s, s2c);
 
     Ok(())
 }

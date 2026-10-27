@@ -116,10 +116,114 @@ impl LocalDnsRelay {
             cipher.crypt_in_place(&mut dns_resp_body, 2);
         }
 
-        // 6. 将真实的 DNS 响应发回给手机应用 (内核 NAT conntrack 会自动反向还原源地址和53端口)
-        socket.send_to(&dns_resp_body, peer).await?;
-        debug!("DNS query resolved via CNS for [{}] ({} bytes)", peer, resp_pkg_len);
+        // 6. 将真实的 DNS 响应发回给手机应用 (优先使用 Raw Socket 伪造 8.8.8.8:53，确保移动端 socket 接收成功)
+        if let Err(e) = Self::send_raw_dns_reply(peer, &dns_resp_body) {
+            tracing::warn!("Raw DNS reply error: {}, falling back to socket.send_to", e);
+            let _ = socket.send_to(&dns_resp_body, peer).await;
+        } else {
+            tracing::info!("Raw DNS reply sent successfully to [{}] as 8.8.8.8:53 ({} bytes)", peer, resp_pkg_len);
+        }
 
         Ok(())
     }
+
+    /// 通过 RAW 套接字精确构造源为 8.8.8.8:53 的真实 DNS 响应报文，彻底消灭 NAT 回包源端口不匹配丢包
+    fn send_raw_dns_reply(peer: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if let SocketAddr::V4(peer_v4) = peer {
+                let dest_ip = peer_v4.ip();
+                let dest_port = peer_v4.port();
+                let src_ip = std::net::Ipv4Addr::new(8, 8, 8, 8);
+                let src_port = 53u16;
+
+                let tot_len = (20 + 8 + payload.len()) as u16;
+                let mut packet = Vec::with_capacity(tot_len as usize);
+
+                // 1. IPv4 头部 (20 字节)
+                packet.push(0x45); // Version 4, IHL 5
+                packet.push(0x00); // DSCP/ECN
+                packet.extend_from_slice(&tot_len.to_be_bytes());
+                packet.extend_from_slice(&54321u16.to_be_bytes()); // Identification
+                packet.extend_from_slice(&0u16.to_be_bytes()); // Flags / Fragment Offset
+                packet.push(64); // TTL
+                packet.push(17); // Protocol: UDP (17)
+                packet.extend_from_slice(&0u16.to_be_bytes()); // Checksum placeholder
+                packet.extend_from_slice(&src_ip.octets());
+                packet.extend_from_slice(&dest_ip.octets());
+
+                // 计算 IPv4 Checksum
+                let ip_csum = calc_checksum(&packet[..20]);
+                packet[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+                // 2. UDP 头部 (8 字节)
+                let udp_len = (8 + payload.len()) as u16;
+                packet.extend_from_slice(&src_port.to_be_bytes());
+                packet.extend_from_slice(&dest_port.to_be_bytes());
+                packet.extend_from_slice(&udp_len.to_be_bytes());
+                packet.extend_from_slice(&0u16.to_be_bytes()); // UDP Checksum (0 表示不校验)
+
+                // 3. DNS 载荷
+                packet.extend_from_slice(payload);
+
+                // 4. 通过 Raw Socket 发送
+                unsafe {
+                    let fd = libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW);
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+
+                    let one: libc::c_int = 1;
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_IP,
+                        libc::IP_HDRINCL,
+                        &one as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&one) as libc::socklen_t,
+                    );
+
+                    let mut dst_sockaddr: libc::sockaddr_in = std::mem::zeroed();
+                    dst_sockaddr.sin_family = libc::AF_INET as libc::sa_family_t;
+                    dst_sockaddr.sin_port = dest_port.to_be();
+                    std::ptr::copy_nonoverlapping(
+                        dest_ip.octets().as_ptr(),
+                        &mut dst_sockaddr.sin_addr as *mut _ as *mut u8,
+                        4,
+                    );
+
+                    let ret = libc::sendto(
+                        fd,
+                        packet.as_ptr() as *const libc::c_void,
+                        packet.len(),
+                        0,
+                        &dst_sockaddr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    );
+
+                    libc::close(fd);
+
+                    if ret < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::Other, "Raw socket unsupported or IPv6"))
+    }
+}
+
+fn calc_checksum(buf: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = buf.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(&rem) = chunks.remainder().first() {
+        sum += (rem as u32) << 8;
+    }
+    while (sum >> 16) > 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }

@@ -87,6 +87,9 @@ start_rules() {
         $tool -w -t nat -I OUTPUT -j CNS_NAT
     done
 
+    # 8. 自动钳制 TCP MSS，避免大包跨洋网络分片丢包
+    iptables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+
     echo "✓ 现代化免流隧道与 DNS 智能中继已完全就绪！"
     status_check
     echo ""
@@ -105,6 +108,8 @@ stop_rules() {
         $tool -w -t nat -F CNS_NAT 2>/dev/null
         $tool -w -t nat -X CNS_NAT 2>/dev/null
     done
+
+    while iptables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
 
     PID=$(cat client.pid 2>/dev/null)
     if [ -n "$PID" ]; then
@@ -146,11 +151,11 @@ run_tests() {
     echo -n "● [1/4] DNS 解析测试 (UDP 53)... "
     DNS_START=$(date +%s%3N 2>/dev/null || date +%s)
     DNS_RES=""
-    if type ping >/dev/null 2>&1; then
-        DNS_RES=$(ping -c 1 -W 2 www.baidu.com 2>/dev/null | grep -E -o '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    if [ -n "$CURL_BIN" ]; then
+        DNS_RES=$($CURL_BIN -s -m 5 -o /dev/null -w "%{remote_ip}" http://www.baidu.com 2>/dev/null)
     fi
-    if [ -z "$DNS_RES" ] && [ -n "$CURL_BIN" ]; then
-        DNS_RES=$($CURL_BIN -s -m 3 -o /dev/null -w "%{remote_ip}" http://www.baidu.com 2>/dev/null)
+    if [ -z "$DNS_RES" ] && type ping >/dev/null 2>&1; then
+        DNS_RES=$(ping -c 1 -W 2 www.baidu.com 2>/dev/null | grep -E -o '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     fi
 
     DNS_END=$(date +%s%3N 2>/dev/null || date +%s)

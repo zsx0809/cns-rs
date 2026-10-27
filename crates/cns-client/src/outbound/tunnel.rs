@@ -103,18 +103,8 @@ impl CnsClientTunnel {
             Ok::<(), io::Error>(())
         };
 
-        tokio::select! {
-            res = local_to_server => {
-                if let Err(e) = res {
-                    debug!("local_to_server stream closed: {}", e);
-                }
-            }
-            res = server_to_local => {
-                if let Err(e) = res {
-                    debug!("server_to_local stream closed: {}", e);
-                }
-            }
-        }
+        // 双向流独立协同传输，支持 TCP 半关闭 (Half-Close)，绝不因单向 EOF 强行掐断另一向数据
+        let _ = tokio::try_join!(local_to_server, server_to_local);
 
         Ok(())
     }
