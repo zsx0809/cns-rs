@@ -59,6 +59,7 @@ async fn test_socks5_to_cns_server_end_to_end() {
     // 3. 本地 cns-client (SOCKS5 服务)
     let client_config = ClientConfig {
         socks5_listen: "127.0.0.1:0".to_string(),
+        dns_listen: String::new(),
         tproxy_listen: None,
         gid: None,
         cns_server: cns_addr.to_string(),

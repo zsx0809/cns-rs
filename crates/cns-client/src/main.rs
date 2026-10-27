@@ -26,9 +26,9 @@ struct Args {
     #[arg(short = 'g', long = "gid")]
     gid: Option<u32>,
 
-    /// Override transparent proxy listen address (e.g., :::6650 or 0.0.0.0:6650)
-    #[arg(short = 't', long = "tproxy-listen")]
-    tproxy_listen: Option<String>,
+    /// Override transparent proxy listen port (e.g., 7750)
+    #[arg(short = 't', long = "tproxy-port")]
+    tproxy_port: Option<u16>,
 
     /// Save PID to file (compatibility with legacy root scripts)
     #[arg(short = 'p', long = "pid-file")]
@@ -46,7 +46,6 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // 如果指定了 pid_file，记录当前进程 PID (配合 Android 模块)
     if let Some(ref pid_path) = args.pid_file {
         let pid = std::process::id();
         let _ = fs::write(pid_path, format!("{}\n", pid));
@@ -62,7 +61,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 优先使用命令行指定的 GID
     let target_gid = args.gid.or(config.gid);
     if let Some(gid) = target_gid {
         if let Err(e) = apply_process_gid(gid) {
@@ -70,11 +68,6 @@ async fn main() -> anyhow::Result<()> {
         } else {
             info!("Successfully switched process GID to {} (anti-routing-loop protection)", gid);
         }
-    }
-
-    // 优先使用命令行指定的透明代理地址
-    if let Some(t_listen) = args.tproxy_listen {
-        config.tproxy_listen = Some(t_listen);
     }
 
     let cipher = CuteBiCipher::new(config.cns_password.as_bytes());
@@ -100,31 +93,45 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 2. 启动 TProxy / REDIRECT 透明代理 Inbound 服务 (Android 模块核心)
-    if let Some(ref tproxy_addr_str) = config_arc.tproxy_listen {
-        let normalized = if tproxy_addr_str.starts_with(':') {
-            format!("[::]{}", tproxy_addr_str)
-        } else {
-            tproxy_addr_str.clone()
-        };
-
-        if let Ok(socket_addr) = normalized.parse::<SocketAddr>() {
-            let cfg_clone = Arc::clone(&config_arc);
-            let cph_clone = Arc::clone(&cipher_arc);
-
-            match create_tcp_listener(socket_addr, cfg_clone.enable_tfo) {
-                Ok(listener) => {
-                    info!("Transparent Proxy (TProxy/REDIRECT) listening on: {}", socket_addr);
-                    tokio::spawn(async move {
-                        run_tproxy_listener(listener, cfg_clone, cph_clone).await;
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to bind Transparent Proxy on {}: {}", socket_addr, e);
-                }
+    // 2. 启动 TProxy / REDIRECT 透明代理 Inbound 服务 (双栈解耦监听)
+    let tproxy_port: Option<u16> = args.tproxy_port.or_else(|| {
+        config_arc.tproxy_listen.as_ref().and_then(|addr| {
+            if let Some(idx) = addr.rfind(':') {
+                addr[idx + 1..].parse::<u16>().ok()
+            } else {
+                addr.parse::<u16>().ok()
             }
-        } else {
-            error!("Invalid tproxy_listen address: {}", tproxy_addr_str);
+        })
+    });
+
+    if let Some(port) = tproxy_port {
+        let v4_addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+        let v6_addr: SocketAddr = format!("[::]:{}", port).parse().unwrap();
+
+        // IPv4 监听器
+        let cfg_v4 = Arc::clone(&config_arc);
+        let cph_v4 = Arc::clone(&cipher_arc);
+        match create_tcp_listener(v4_addr, cfg_v4.enable_tfo) {
+            Ok(listener) => {
+                info!("Transparent Proxy (IPv4 REDIRECT) listening on: {}", v4_addr);
+                tokio::spawn(async move {
+                    run_tproxy_listener(listener, cfg_v4, cph_v4).await;
+                });
+            }
+            Err(e) => warn!("Failed to bind IPv4 Transparent Proxy on {}: {}", v4_addr, e),
+        }
+
+        // IPv6 监听器
+        let cfg_v6 = Arc::clone(&config_arc);
+        let cph_v6 = Arc::clone(&cipher_arc);
+        match create_tcp_listener(v6_addr, cfg_v6.enable_tfo) {
+            Ok(listener) => {
+                info!("Transparent Proxy (IPv6 REDIRECT) listening on: {}", v6_addr);
+                tokio::spawn(async move {
+                    run_tproxy_listener(listener, cfg_v6, cph_v6).await;
+                });
+            }
+            Err(e) => warn!("Failed to bind IPv6 Transparent Proxy on {}: {}", v6_addr, e),
         }
     }
 
@@ -133,7 +140,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("Shutdown signal received. Exiting client...");
 
-    // 清理 pid 文件
     if let Some(ref pid_path) = args.pid_file {
         let _ = fs::remove_file(pid_path);
     }
@@ -190,7 +196,6 @@ async fn run_tproxy_listener(
                 let cph = Arc::clone(&cipher);
 
                 tokio::spawn(async move {
-                    // 获取 Linux iptables 劫持前的真实目标地址
                     match get_original_dst(&stream) {
                         Ok(target_addr) => {
                             let target_host = target_addr.to_string();

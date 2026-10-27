@@ -8,6 +8,9 @@ pub struct ClientConfig {
     #[serde(default = "default_socks5_listen")]
     pub socks5_listen: String,
 
+    #[serde(default = "default_dns_listen")]
+    pub dns_listen: String,
+
     #[serde(default)]
     pub tproxy_listen: Option<String>,
 
@@ -42,6 +45,10 @@ fn default_socks5_listen() -> String {
     "127.0.0.1:1080".to_string()
 }
 
+fn default_dns_listen() -> String {
+    "127.0.0.1:6653".to_string()
+}
+
 fn default_proxy_key() -> String {
     "Meng".to_string()
 }
@@ -66,6 +73,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             socks5_listen: default_socks5_listen(),
+            dns_listen: default_dns_listen(),
             tproxy_listen: None,
             gid: None,
             cns_server: "127.0.0.1:1254".to_string(),

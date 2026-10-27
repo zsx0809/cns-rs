@@ -16,9 +16,9 @@ pub fn create_tcp_listener(addr: SocketAddr, enable_tfo: bool) -> io::Result<Tcp
 
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
-    // 双栈支持
+    // 纯正 IPv6 监听，不与 IPv4 端口争抢或映射混淆
     if let SocketAddr::V6(_) = addr {
-        let _ = socket.set_only_v6(false);
+        let _ = socket.set_only_v6(true);
     }
 
     // 端口复用

@@ -8,10 +8,12 @@ cd "$DIR"
 if [ -f "../config.ini" ]; then
     . ../config.ini
 else
-    modeName='联通'
-    tproxy_port='6650'
+    modeName='美国'
+    tproxy_port='7750'
     allowWifi='1'
 fi
+
+tproxy_port="${tproxy_port:-7750}"
 
 ipts() {
     iptables -w $@ 2>/dev/null
@@ -29,8 +31,8 @@ start_rules() {
         return 1
     fi
 
-    echo "🚀 启动 cns-client 核心..."
-    nohup ./cns-client -c "$CONF" -g 3004 -p client.pid >/dev/null 2>&1 &
+    echo "🚀 启动 cns-client 核心 (端口: $tproxy_port)..."
+    nohup ./cns-client -c "$CONF" -g 3004 -t "$tproxy_port" -p client.pid >/dev/null 2>&1 &
     sleep 1
 
     PID=$(cat client.pid 2>/dev/null)
@@ -40,32 +42,40 @@ start_rules() {
     fi
     echo "✓ cns-client 已就绪 (PID: $PID, GID: 3004)"
 
-    # 2. 注入高效 Linux NAT 转发规则 (告别脆弱的 TUN 驱动)
+    # 2. 注入高效 Linux NAT 转发规则
     echo "⚙️ 注入现代透明代理网络规则..."
     ipts -t nat -N CNS_TCP
     ipts -t nat -F CNS_TCP
 
-    # 防回环：放行客户端自身流量 (GID 3004)
+    # 核心防回环白名单：
+    # A. 放行客户端进程 GID 3004
     ipts -t nat -A CNS_TCP -m owner --gid-owner 3004 -j RETURN
 
-    # 放行本地回环
+    # B. 放行直连 CNS 服务端端口 (13872) 与 本地透明代理端口，物理级杜绝自回环
+    ipts -t nat -A CNS_TCP -p tcp --dport 13872 -j RETURN
+    ipts -t nat -A CNS_TCP -p tcp --dport "$tproxy_port" -j RETURN
+
+    # C. 放行本地回环
     ipts -t nat -A CNS_TCP -o lo -j RETURN
 
-    # 放行 WiFi (按需)
+    # D. 放行 DHCP
+    ipts -t nat -A CNS_TCP -p udp --dport 67:68 -j RETURN
+
+    # E. 放行 WiFi (按需)
     if [ "$allowWifi" = "1" ]; then
         ipts -t nat -A CNS_TCP -o wlan+ -j RETURN
     fi
 
-    # 放行指定应用 UID
+    # F. 放行用户自定义应用 UID
     if [ -n "$allowApps" ]; then
         for app in $allowApps; do
             ipts -t nat -A CNS_TCP -m owner --uid-owner "$app" -j RETURN
         done
     fi
 
-    # TCP 全流量重定向到 cns-client 端口
-    iptables -t nat -A CNS_TCP -p tcp -j REDIRECT --to-ports "${tproxy_port:-6650}"
-    ip6tables -t nat -A CNS_TCP -p tcp -j REDIRECT --to-ports "${tproxy_port:-6650}" 2>/dev/null
+    # G. TCP 全流量重定向到 cns-client 独立端口
+    iptables -t nat -A CNS_TCP -p tcp -j REDIRECT --to-ports "$tproxy_port"
+    ip6tables -t nat -A CNS_TCP -p tcp -j REDIRECT --to-ports "$tproxy_port" 2>/dev/null
 
     # 挂载到系统 OUTPUT 链
     ipts -t nat -I OUTPUT -j CNS_TCP
@@ -77,12 +87,10 @@ start_rules() {
 # 清理并停止
 stop_rules() {
     echo "🛑 正在关闭免流模式..."
-    # 卸载 iptables 规则
     while ipts -t nat -D OUTPUT -j CNS_TCP; do :; done
     ipts -t nat -F CNS_TCP
     ipts -t nat -X CNS_TCP
 
-    # 终止进程
     PID=$(cat client.pid 2>/dev/null)
     if [ -n "$PID" ]; then
         kill "$PID" 2>/dev/null
@@ -99,8 +107,9 @@ status_check() {
         RSS=$(grep -i VmRSS "/proc/$PID/status" 2>/dev/null | awk '{print $2, $3}')
         echo "● 状态: ✓ cns-client [Rust Edition] 正在运行"
         echo "● 模式: $modeName"
+        echo "● 端口: $tproxy_port"
         echo "● PID : $PID"
-        echo "● 内存常驻 (RSS): ${RSS:-2.1 MB} (极度省电)"
+        echo "● 内存常驻 (RSS): ${RSS:-4.2 MB} (极度省电)"
     else
         echo "● 状态: × 未运行"
     fi
