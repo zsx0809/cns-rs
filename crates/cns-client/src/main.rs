@@ -8,7 +8,11 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
+
+/// 客户端本地最大并发保护上限，避免系统应用突发高并发吃光 Android 内存
+const CLIENT_MAX_CONCURRENCY: usize = 2048;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,10 +49,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 默认输出 warn 级别日志，避免长时间运行 client.log 填满手机存储空间
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -58,8 +63,6 @@ async fn main() -> anyhow::Result<()> {
         let pid = std::process::id();
         let _ = fs::write(pid_path, format!("{}\n", pid));
     }
-
-    info!("Loading client configuration from: {}", args.config);
 
     let config = match ClientConfig::from_file(&args.config) {
         Ok(cfg) => cfg,
@@ -73,26 +76,25 @@ async fn main() -> anyhow::Result<()> {
     if let Some(gid) = target_gid {
         if let Err(e) = apply_process_gid(gid) {
             warn!("Failed to set process GID {}: {}. Running with current GID.", gid, e);
-        } else {
-            info!("Successfully switched process GID to {} (anti-routing-loop protection)", gid);
         }
     }
 
     let cipher = CuteBiCipher::new(config.cns_password.as_bytes());
     let config_arc = Arc::new(config);
     let cipher_arc = Arc::new(cipher);
+    let semaphore = Arc::new(Semaphore::new(CLIENT_MAX_CONCURRENCY));
 
     // 1. 启动 SOCKS5 Inbound 服务
     if !config_arc.socks5_listen.is_empty() {
         let socks5_addr = config_arc.socks5_listen.clone();
         let cfg_clone = Arc::clone(&config_arc);
         let cph_clone = Arc::clone(&cipher_arc);
+        let sem_clone = Arc::clone(&semaphore);
 
         tokio::spawn(async move {
             match TcpListener::bind(&socks5_addr).await {
                 Ok(listener) => {
-                    info!("SOCKS5 Inbound listening on: {}", socks5_addr);
-                    run_socks5_listener(listener, cfg_clone, cph_clone).await;
+                    run_socks5_listener(listener, cfg_clone, cph_clone, sem_clone).await;
                 }
                 Err(e) => {
                     warn!("Failed to bind SOCKS5 on {}: {}", socks5_addr, e);
@@ -119,11 +121,11 @@ async fn main() -> anyhow::Result<()> {
         // IPv4 监听器
         let cfg_v4 = Arc::clone(&config_arc);
         let cph_v4 = Arc::clone(&cipher_arc);
+        let sem_v4 = Arc::clone(&semaphore);
         match create_tcp_listener(v4_addr, cfg_v4.enable_tfo) {
             Ok(listener) => {
-                info!("Transparent Proxy (IPv4 TPROXY/REDIRECT) listening on: {}", v4_addr);
                 tokio::spawn(async move {
-                    run_tproxy_listener(listener, port, cfg_v4, cph_v4).await;
+                    run_tproxy_listener(listener, port, cfg_v4, cph_v4, sem_v4).await;
                 });
             }
             Err(e) => warn!("Failed to bind IPv4 Transparent Proxy on {}: {}", v4_addr, e),
@@ -132,11 +134,11 @@ async fn main() -> anyhow::Result<()> {
         // IPv6 监听器
         let cfg_v6 = Arc::clone(&config_arc);
         let cph_v6 = Arc::clone(&cipher_arc);
+        let sem_v6 = Arc::clone(&semaphore);
         match create_tcp_listener(v6_addr, cfg_v6.enable_tfo) {
             Ok(listener) => {
-                info!("Transparent Proxy (IPv6 TPROXY/REDIRECT) listening on: {}", v6_addr);
                 tokio::spawn(async move {
-                    run_tproxy_listener(listener, port, cfg_v6, cph_v6).await;
+                    run_tproxy_listener(listener, port, cfg_v6, cph_v6, sem_v6).await;
                 });
             }
             Err(e) => warn!("Failed to bind IPv6 Transparent Proxy on {}: {}", v6_addr, e),
@@ -152,7 +154,6 @@ async fn main() -> anyhow::Result<()> {
                 warn!("Local DNS Relay error: {}", e);
             }
         });
-        info!("Local UDP DNS Relay listening on: {}", dns_addr);
     }
 
     // 4. 启动原生 Micro-TUN 虚拟网卡引擎 (如果指定了 --tun 参数)
@@ -165,13 +166,9 @@ async fn main() -> anyhow::Result<()> {
                 error!("Micro-TUN runner error: {}", e);
             }
         });
-        info!("Micro-TUN device [{}] requested and spawning async loop", dev_name);
     }
 
-    info!("Upstream CNS Server: {}", config_arc.cns_server);
-
     tokio::signal::ctrl_c().await?;
-    info!("Shutdown signal received. Exiting client...");
 
     if let Some(ref pid_path) = args.pid_file {
         let _ = fs::remove_file(pid_path);
@@ -184,27 +181,35 @@ async fn run_socks5_listener(
     listener: TcpListener,
     config: Arc<ClientConfig>,
     cipher: Arc<CuteBiCipher>,
+    semaphore: Arc<Semaphore>,
 ) {
     loop {
         match listener.accept().await {
             Ok((mut stream, peer_addr)) => {
                 tune_tcp_stream(&stream);
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("Client concurrency limit reached, dropping SOCKS5 connection from {}", peer_addr);
+                        drop(stream);
+                        continue;
+                    }
+                };
+
                 let cfg = Arc::clone(&config);
                 let cph = Arc::clone(&cipher);
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match Socks5Handshake::handle(&mut stream).await {
                         Ok(Socks5Command::Connect { target }) => {
-                            tracing::debug!("SOCKS5 Proxying [{}] from [{}]", target, peer_addr);
-                            if let Err(e) = CnsClientTunnel::handle_tcp_proxy(stream, &target, &cfg, &cph).await {
-                                tracing::debug!("TCP proxy session ended: {}", e);
-                            }
+                            let _ = CnsClientTunnel::handle_tcp_proxy(stream, &target, &cfg, &cph).await;
                         }
                         Ok(Socks5Command::UdpAssociate) => {
                             warn!("UDP Associate requested from [{}].", peer_addr);
                         }
                         Err(e) => {
-                            tracing::debug!("SOCKS5 handshake error from [{}]: {}", peer_addr, e);
+                            tracing::debug!("SOCKS5 handshake error: {}", e);
                         }
                     }
                 });
@@ -221,25 +226,33 @@ async fn run_tproxy_listener(
     listen_port: u16,
     config: Arc<ClientConfig>,
     cipher: Arc<CuteBiCipher>,
+    semaphore: Arc<Semaphore>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 tune_tcp_stream(&stream);
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("Client concurrency limit reached, dropping TProxy connection from {}", peer_addr);
+                        drop(stream);
+                        continue;
+                    }
+                };
+
                 let cfg = Arc::clone(&config);
                 let cph = Arc::clone(&cipher);
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match get_original_dst(&stream, listen_port) {
                         Ok(target_addr) => {
                             let target_host = target_addr.to_string();
-                            info!("TProxy intercepted connection to [{}] from [{}]", target_host, peer_addr);
-                            if let Err(e) = CnsClientTunnel::handle_tcp_proxy(stream, &target_host, &cfg, &cph).await {
-                                warn!("TProxy session ended: {}", e);
-                            }
+                            let _ = CnsClientTunnel::handle_tcp_proxy(stream, &target_host, &cfg, &cph).await;
                         }
                         Err(e) => {
-                            warn!("Failed to get original dst from [{}]: {}", peer_addr, e);
+                            tracing::debug!("Failed to get original dst from [{}]: {}", peer_addr, e);
                         }
                     }
                 });

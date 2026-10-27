@@ -2,7 +2,8 @@ use crate::config::ClientConfig;
 use cns_core::crypto::CuteBiCipher;
 use cns_core::transport::tune_tcp_stream;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -10,6 +11,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 /// 本地 DNS 代理服务器：接收本地 UDP DNS 请求，包装成 tcpDNS 走免流隧道向 CNS 服务端查询
+/// 并利用 IP_RECVORIGDSTADDR 精确捕获原始目的 IP，回包时通过 Raw Socket 动态伪造源 IP
 pub struct LocalDnsRelay;
 
 impl LocalDnsRelay {
@@ -18,15 +20,56 @@ impl LocalDnsRelay {
         config: Arc<ClientConfig>,
         cipher: Arc<CuteBiCipher>,
     ) -> io::Result<()> {
-        let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
-        debug!("Local DNS Relay listening on UDP: {}", listen_addr);
+        let domain = match listen_addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+
+        let std_sock = socket2::Socket::new(
+            domain,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        std_sock.set_nonblocking(true)?;
+        std_sock.set_reuse_address(true)?;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let one: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    std_sock.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_RECVORIGDSTADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+            }
+        }
+
+        std_sock.bind(&listen_addr.into())?;
+        let socket = Arc::new(UdpSocket::from_std(std_sock.into())?);
+        debug!("Local DNS Relay listening on UDP: {} (with IP_RECVORIGDSTADDR enabled)", listen_addr);
 
         let mut buf = vec![0u8; 4096];
+        let mut ctrl_buf = [0u8; 512];
+
         loop {
-            let (len, peer) = match socket.recv_from(&mut buf).await {
-                Ok(res) => res,
+            // 等待套接字可读
+            if let Err(e) = socket.readable().await {
+                warn!("DNS relay readable error: {}", e);
+                continue;
+            }
+
+            // 尝试读取带控制信息的数据包
+            let raw_fd = socket.as_raw_fd();
+            let recv_res = recv_packet_with_orig_dst(raw_fd, &mut buf, &mut ctrl_buf);
+
+            let (len, peer, orig_dst) = match recv_res {
+                Ok(Some(res)) => res,
+                Ok(None) => continue, // WouldBlock
                 Err(e) => {
-                    warn!("DNS relay recv_from error: {}", e);
+                    warn!("DNS recvmsg error: {}", e);
                     continue;
                 }
             };
@@ -37,8 +80,8 @@ impl LocalDnsRelay {
             let cph_clone = Arc::clone(&cipher);
 
             tokio::spawn(async move {
-                if let Err(e) = Self::forward_dns(sock_clone, peer, query, &cfg_clone, &cph_clone).await {
-                    debug!("DNS query from [{}] failed: {}", peer, e);
+                if let Err(e) = Self::forward_dns(sock_clone, peer, orig_dst, query, &cfg_clone, &cph_clone).await {
+                    debug!("DNS query from [{}] -> [{}] failed: {}", peer, orig_dst, e);
                 }
             });
         }
@@ -47,6 +90,7 @@ impl LocalDnsRelay {
     async fn forward_dns(
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
+        orig_dst: SocketAddr,
         query: Vec<u8>,
         config: &ClientConfig,
         cipher: &CuteBiCipher,
@@ -55,12 +99,12 @@ impl LocalDnsRelay {
         let mut server_stream = TcpStream::connect(&config.cns_server).await?;
         tune_tcp_stream(&server_stream);
 
-        // 2. 目标为 8.8.8.8:53，加密并包装 HTTP 握手头
-        let target_host = "8.8.8.8:53";
+        // 2. 向上游公共 DNS 查询 (8.8.8.8:53)，确保海外 VPS 能稳定递归解析
+        let upstream_dns = "8.8.8.8:53";
         let encrypted_target = if !cipher.is_empty() {
-            cipher.encrypt_host(target_host)
+            cipher.encrypt_host(upstream_dns)
         } else {
-            target_host.to_string()
+            upstream_dns.to_string()
         };
 
         let handshake_req = config.render_fake_header(&encrypted_target);
@@ -116,26 +160,31 @@ impl LocalDnsRelay {
             cipher.crypt_in_place(&mut dns_resp_body, 2);
         }
 
-        // 6. 将真实的 DNS 响应发回给手机应用 (优先使用 Raw Socket 伪造 8.8.8.8:53，确保移动端 socket 接收成功)
-        if let Err(e) = Self::send_raw_dns_reply(peer, &dns_resp_body) {
-            tracing::warn!("Raw DNS reply error: {}, falling back to socket.send_to", e);
+        // 6. 将真实的 DNS 响应发回给手机应用 (使用 Raw Socket 伪装为客户端原本请求的 orig_dst)
+        if let Err(e) = Self::send_raw_dns_reply(peer, orig_dst, &dns_resp_body) {
+            tracing::warn!("Raw DNS reply failed: {}, fallback to socket.send_to", e);
             let _ = socket.send_to(&dns_resp_body, peer).await;
         } else {
-            tracing::info!("Raw DNS reply sent successfully to [{}] as 8.8.8.8:53 ({} bytes)", peer, resp_pkg_len);
+            tracing::debug!(
+                "Raw DNS reply sent successfully to [{}] as [{}] ({} bytes)",
+                peer,
+                orig_dst,
+                resp_pkg_len
+            );
         }
 
         Ok(())
     }
 
-    /// 通过 RAW 套接字精确构造源为 8.8.8.8:53 的真实 DNS 响应报文，彻底消灭 NAT 回包源端口不匹配丢包
-    fn send_raw_dns_reply(peer: SocketAddr, payload: &[u8]) -> io::Result<()> {
+    /// 通过 RAW 套接字精确构造源为客户端原始请求目标 (orig_dst) 的真实 DNS 响应报文
+    fn send_raw_dns_reply(peer: SocketAddr, orig_dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            if let SocketAddr::V4(peer_v4) = peer {
+            if let (SocketAddr::V4(peer_v4), SocketAddr::V4(orig_v4)) = (peer, orig_dst) {
                 let dest_ip = peer_v4.ip();
                 let dest_port = peer_v4.port();
-                let src_ip = std::net::Ipv4Addr::new(8, 8, 8, 8);
-                let src_port = 53u16;
+                let src_ip = orig_v4.ip();
+                let src_port = orig_v4.port();
 
                 let tot_len = (20 + 8 + payload.len()) as u16;
                 let mut packet = Vec::with_capacity(tot_len as usize);
@@ -158,15 +207,20 @@ impl LocalDnsRelay {
 
                 // 2. UDP 头部 (8 字节)
                 let udp_len = (8 + payload.len()) as u16;
-                packet.extend_from_slice(&src_port.to_be_bytes());
-                packet.extend_from_slice(&dest_port.to_be_bytes());
-                packet.extend_from_slice(&udp_len.to_be_bytes());
-                packet.extend_from_slice(&0u16.to_be_bytes()); // UDP Checksum (0 表示不校验)
+                let mut udp_hdr = Vec::with_capacity(8 + payload.len());
+                udp_hdr.extend_from_slice(&src_port.to_be_bytes());
+                udp_hdr.extend_from_slice(&dest_port.to_be_bytes());
+                udp_hdr.extend_from_slice(&udp_len.to_be_bytes());
+                udp_hdr.extend_from_slice(&0u16.to_be_bytes()); // Checksum placeholder
+                udp_hdr.extend_from_slice(payload);
 
-                // 3. DNS 载荷
-                packet.extend_from_slice(payload);
+                // 计算完整 UDP Checksum (包含伪首部)
+                let udp_csum = calc_udp_checksum(*src_ip, *dest_ip, &udp_hdr);
+                udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
 
-                // 4. 通过 Raw Socket 发送
+                packet.extend_from_slice(&udp_hdr);
+
+                // 3. 通过 Raw Socket 发送
                 unsafe {
                     let fd = libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW);
                     if fd < 0 {
@@ -213,6 +267,73 @@ impl LocalDnsRelay {
     }
 }
 
+/// 使用 libc::recvmsg 接收数据包并解析控制消息以提取原目标地址
+fn recv_packet_with_orig_dst(
+    raw_fd: std::os::unix::io::RawFd,
+    buf: &mut [u8],
+    ctrl_buf: &mut [u8],
+) -> io::Result<Option<(usize, SocketAddr, SocketAddr)>> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+
+        let mut src_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+
+        let mut msghdr = libc::msghdr {
+            msg_name: &mut src_addr as *mut _ as *mut libc::c_void,
+            msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: ctrl_buf.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: ctrl_buf.len() as libc::size_t,
+            msg_flags: 0,
+        };
+
+        let n = unsafe { libc::recvmsg(raw_fd, &mut msghdr, libc::MSG_DONTWAIT) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+
+        let peer_ip = Ipv4Addr::from(src_addr.sin_addr.s_addr.to_ne_bytes());
+        let peer_port = u16::from_be(src_addr.sin_port);
+        let peer = SocketAddr::V4(SocketAddrV4::new(peer_ip, peer_port));
+
+        let orig_dst = unsafe { parse_orig_dst(&msghdr) }.unwrap_or_else(|| {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53))
+        });
+
+        Ok(Some((n as usize, peer, orig_dst)))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Err(io::Error::new(io::ErrorKind::Other, "Unsupported OS"))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn parse_orig_dst(msghdr: &libc::msghdr) -> Option<SocketAddr> {
+    let mut cmsg = libc::CMSG_FIRSTHDR(msghdr);
+    while !cmsg.is_null() {
+        let cm = &*cmsg;
+        if cm.cmsg_level == libc::IPPROTO_IP && cm.cmsg_type == libc::IP_ORIGDSTADDR {
+            let sin = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in;
+            let ip_bytes = (*sin).sin_addr.s_addr.to_ne_bytes();
+            let port = u16::from_be((*sin).sin_port);
+            let ip = Ipv4Addr::from(ip_bytes);
+            return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+        }
+        cmsg = libc::CMSG_NXTHDR(msghdr, cmsg);
+    }
+    None
+}
+
 fn calc_checksum(buf: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut chunks = buf.chunks_exact(2);
@@ -226,4 +347,36 @@ fn calc_checksum(buf: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+fn calc_udp_checksum(src_ip: Ipv4Addr, dest_ip: Ipv4Addr, udp_hdr_and_payload: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let s = src_ip.octets();
+    sum += u16::from_be_bytes([s[0], s[1]]) as u32;
+    sum += u16::from_be_bytes([s[2], s[3]]) as u32;
+
+    let d = dest_ip.octets();
+    sum += u16::from_be_bytes([d[0], d[1]]) as u32;
+    sum += u16::from_be_bytes([d[2], d[3]]) as u32;
+
+    sum += 17u32; // IPPROTO_UDP
+    let udp_len = udp_hdr_and_payload.len() as u16;
+    sum += udp_len as u32;
+
+    let mut chunks = udp_hdr_and_payload.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(&rem) = chunks.remainder().first() {
+        sum += (rem as u32) << 8;
+    }
+    while (sum >> 16) > 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let res = !(sum as u16);
+    if res == 0 {
+        0xffff
+    } else {
+        res
+    }
 }

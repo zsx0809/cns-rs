@@ -87,7 +87,10 @@ start_rules() {
         $tool -w -t nat -I OUTPUT -j CNS_NAT
     done
 
-    # 8. 自动钳制 TCP MSS，避免大包跨洋网络分片丢包
+    # 8. 拦截 QUIC (UDP 443)，促使客户端秒级回退至基于 TCP 的 TLS 1.3 / HTTP/2，消灭图片加载卡死
+    iptables -w -I OUTPUT -p udp --dport 443 -j REJECT 2>/dev/null
+
+    # 9. 自动钳制 TCP MSS，避免大包跨洋网络分片丢包
     iptables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 
     echo "✓ 现代化免流隧道与 DNS 智能中继已完全就绪！"
@@ -109,6 +112,7 @@ stop_rules() {
         $tool -w -t nat -X CNS_NAT 2>/dev/null
     done
 
+    while iptables -w -D OUTPUT -p udp --dport 443 -j REJECT 2>/dev/null; do :; done
     while iptables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
 
     PID=$(cat client.pid 2>/dev/null)
@@ -189,9 +193,9 @@ run_tests() {
     HTTPS_START=$(date +%s%3N 2>/dev/null || date +%s)
     HTTPS_CODE=""
     if [ -n "$CURL_BIN" ]; then
-        HTTPS_CODE=$($CURL_BIN -k -s -m 8 -o /dev/null -w "%{http_code}" https://www.google.com 2>/dev/null)
+        HTTPS_CODE=$($CURL_BIN -k -s -m 8 -o /dev/null -w "%{http_code}" https://www.baidu.com 2>/dev/null)
         if [ -z "$HTTPS_CODE" ] || [ "$HTTPS_CODE" = "000" ]; then
-            HTTPS_CODE=$($CURL_BIN -k -s -m 8 -o /dev/null -w "%{http_code}" https://www.baidu.com 2>/dev/null)
+            HTTPS_CODE=$($CURL_BIN -k -s -m 8 -o /dev/null -w "%{http_code}" https://www.google.com 2>/dev/null)
         fi
     fi
     HTTPS_END=$(date +%s%3N 2>/dev/null || date +%s)

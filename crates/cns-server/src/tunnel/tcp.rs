@@ -4,11 +4,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, info};
 
 const BUFFER_SIZE: usize = 32 * 1024; // 32KB 零拷贝缓冲
 
-/// TCP 双向流式原位异或数据泵
+/// TCP 双向流式原位异或数据泵 (零垃圾产生、高性能非阻塞传输)
 pub async fn pump_tcp_stream(
     mut client: TcpStream,
     mut server: TcpStream,
@@ -32,11 +31,6 @@ pub async fn pump_tcp_stream(
             if !client_cipher.is_empty() {
                 pass_sub = client_cipher.crypt_in_place(&mut init_buf, pass_sub);
             }
-            info!(
-                "Initial client payload forwarded ({} bytes): {:?}",
-                init_buf.len(),
-                String::from_utf8_lossy(&init_buf[..init_buf.len().min(64)])
-            );
             timeout(tcp_timeout, s_write.write_all(&init_buf))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "initial write timed out"))??;
@@ -54,12 +48,6 @@ pub async fn pump_tcp_stream(
             if !client_cipher.is_empty() {
                 pass_sub = client_cipher.crypt_in_place(&mut buf[..n], pass_sub);
             }
-
-            info!(
-                "Client decrypted {} bytes to upstream: {:?}",
-                n,
-                String::from_utf8_lossy(&buf[..n.min(64)])
-            );
 
             timeout(tcp_timeout, s_write.write_all(&buf[..n]))
                 .await
@@ -81,12 +69,6 @@ pub async fn pump_tcp_stream(
                 Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "s2c read timed out")),
             };
 
-            info!(
-                "Upstream returned {} raw bytes: {:?}",
-                n,
-                String::from_utf8_lossy(&buf[..n.min(64)])
-            );
-
             if !server_cipher.is_empty() {
                 pass_sub = server_cipher.crypt_in_place(&mut buf[..n], pass_sub);
             }
@@ -99,8 +81,6 @@ pub async fn pump_tcp_stream(
         Ok::<(), io::Error>(())
     };
 
-    // 双向流独立协同传输，支持 TCP 半关闭 (Half-Close)，绝不因单向 EOF 强行掐断另一向数据
-    let _ = tokio::try_join!(c2s, s2c);
-
+    tokio::try_join!(c2s, s2c)?;
     Ok(())
 }
