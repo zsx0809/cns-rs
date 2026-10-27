@@ -8,6 +8,12 @@ pub struct ClientConfig {
     #[serde(default = "default_socks5_listen")]
     pub socks5_listen: String,
 
+    #[serde(default)]
+    pub tproxy_listen: Option<String>,
+
+    #[serde(default)]
+    pub gid: Option<u32>,
+
     pub cns_server: String,
 
     #[serde(default)]
@@ -60,6 +66,8 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             socks5_listen: default_socks5_listen(),
+            tproxy_listen: None,
+            gid: None,
             cns_server: "127.0.0.1:1254".to_string(),
             cns_password: String::new(),
             proxy_key: default_proxy_key(),
@@ -83,7 +91,6 @@ impl ClientConfig {
         Duration::from_secs(self.timeout_seconds)
     }
 
-    /// 渲染 HTTP 伪装握手头
     pub fn render_fake_header(&self, encrypted_target: &str) -> Vec<u8> {
         if let Some(ref tpl) = self.custom_header {
             let rendered = tpl
@@ -92,7 +99,6 @@ impl ClientConfig {
                 .replace("[ENCRYPTED_TARGET]", encrypted_target);
             rendered.into_bytes()
         } else {
-            // 经典默认免流模板
             format!(
                 "GET / HTTP/1.1\r\nHost: {}\r\n{}: {}\r\n\r\n",
                 self.header_host, self.proxy_key, encrypted_target
@@ -101,7 +107,6 @@ impl ClientConfig {
         }
     }
 
-    /// 渲染 UDP (httpUDP) 握手头
     pub fn render_udp_header(&self) -> Vec<u8> {
         format!(
             "GET / HTTP/1.1\r\nHost: {}\r\n{}: on\r\n\r\n",

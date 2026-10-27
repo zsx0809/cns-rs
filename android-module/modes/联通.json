@@ -1,0 +1,13 @@
+{
+  "socks5_listen": "127.0.0.1:1080",
+  "tproxy_listen": "[::]:6650",
+  "gid": 3004,
+  "cns_server": "YOUR_SERVER_IP:13872",
+  "cns_password": "your_password_here",
+  "proxy_key": "Meng",
+  "udp_flag": "httpUDP",
+  "header_host": "mclient.alipay.com",
+  "custom_header": null,
+  "enable_tfo": true,
+  "timeout_seconds": 60
+}
