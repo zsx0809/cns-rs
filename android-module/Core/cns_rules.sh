@@ -29,13 +29,15 @@ start_rules() {
         return 1
     fi
 
-    echo "🚀 启动 cns-client 核心 (TCP代理: $tproxy_port, DNS中继: 6653)..."
-    nohup ./cns-client -c "$CONF" -g 3004 -t "$tproxy_port" --dns-listen "0.0.0.0:6653" -p client.pid >/dev/null 2>&1 &
+    DNS_PORT="7753"
+    echo "🚀 启动 cns-client 核心 (TCP代理: $tproxy_port, DNS中继: $DNS_PORT)..."
+    ./cns-client -c "$CONF" -g 3004 -t "$tproxy_port" --dns-listen "0.0.0.0:$DNS_PORT" -p client.pid > client.log 2>&1 &
     sleep 1
 
     PID=$(cat client.pid 2>/dev/null)
     if [ -z "$PID" ] || [ ! -d "/proc/$PID" ]; then
-        echo "❌ cns-client 启动失败，请检查配置文件格式！"
+        echo "❌ cns-client 启动失败，请检查 client.log！"
+        cat client.log 2>/dev/null
         return 1
     fi
     echo "✓ cns-client 已就绪 (PID: $PID, GID: 3004)"
@@ -48,7 +50,7 @@ start_rules() {
     ipts -t nat -A CNS_TCP -m owner --gid-owner 3004 -j RETURN
     ipts -t nat -A CNS_TCP -p tcp --dport 13872 -j RETURN
     ipts -t nat -A CNS_TCP -p tcp --dport "$tproxy_port" -j RETURN
-    ipts -t nat -A CNS_TCP -p udp --dport 6653 -j RETURN
+    ipts -t nat -A CNS_TCP -p udp --dport "$DNS_PORT" -j RETURN
 
     # 2. 基础放行
     ipts -t nat -A CNS_TCP -o lo -j RETURN
@@ -66,9 +68,9 @@ start_rules() {
         done
     fi
 
-    # 5. DNS 拦截：将所有 UDP 53 端口重定向到本地 6653
-    iptables -t nat -A CNS_TCP -p udp --dport 53 -j REDIRECT --to-ports 6653
-    ip6tables -t nat -A CNS_TCP -p udp --dport 53 -j REDIRECT --to-ports 6653 2>/dev/null
+    # 5. DNS 拦截：将所有 UDP 53 端口重定向到本地 DNS 中继端口
+    iptables -t nat -A CNS_TCP -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+    ip6tables -t nat -A CNS_TCP -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null
 
     # 6. TCP 全流量重定向到 cns-client 端口
     iptables -t nat -A CNS_TCP -p tcp -j REDIRECT --to-ports "$tproxy_port"
