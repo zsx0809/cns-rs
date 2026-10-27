@@ -1,0 +1,10 @@
+{
+  "listen_addr": [":1254"],
+  "proxy_key": "Meng",
+  "udp_flag": "httpUDP",
+  "encrypt_password": "your_password_here",
+  "tcp_timeout": 300,
+  "udp_timeout": 30,
+  "enable_dns_tcp_over_udp": true,
+  "enable_tfo": true
+}
