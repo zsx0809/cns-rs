@@ -215,9 +215,9 @@ async fn run_tproxy_listener(
                     match get_original_dst(&stream) {
                         Ok(target_addr) => {
                             let target_host = target_addr.to_string();
-                            tracing::debug!("TProxy intercepted connection to [{}] from [{}]", target_host, peer_addr);
+                            info!("TProxy intercepted connection to [{}] from [{}]", target_host, peer_addr);
                             if let Err(e) = CnsClientTunnel::handle_tcp_proxy(stream, &target_host, &cfg, &cph).await {
-                                tracing::debug!("TProxy session ended: {}", e);
+                                warn!("TProxy session ended: {}", e);
                             }
                         }
                         Err(e) => {

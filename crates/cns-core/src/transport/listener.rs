@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::debug;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::io::AsRawFd;
 
 /// 创建经过全链路高性能调优的 TCP 监听器
@@ -32,7 +32,7 @@ pub fn create_tcp_listener(addr: SocketAddr, enable_tfo: bool) -> io::Result<Tcp
 
     // TCP Fast Open (0-RTT 握手)
     if enable_tfo {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         unsafe {
             let qlen: libc::c_int = 1024;
             let ret = libc::setsockopt(

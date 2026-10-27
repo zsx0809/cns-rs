@@ -2,12 +2,12 @@ use std::io;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::io::AsRawFd;
 
-/// 获取经过 Linux iptables REDIRECT / TPROXY 劫持前的真实目标地址 (SO_ORIGINAL_DST)
+/// 获取经过 Linux / Android iptables REDIRECT / TPROXY 劫持前的真实目标地址 (SO_ORIGINAL_DST)
 pub fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let fd = stream.as_raw_fd();
 
@@ -46,7 +46,8 @@ pub fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
         }
     }
 
-    // 非 Linux 或未被 REDIRECT 劫持时，回退到对端地址
+    // 非 Linux/Android 或未被 REDIRECT 劫持时，回退到对端地址
+    tracing::warn!("SO_ORIGINAL_DST failed or not redirected, fallback to peer_addr");
     stream.peer_addr()
 }
 
