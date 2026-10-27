@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, info};
 
 const BUFFER_SIZE: usize = 32 * 1024; // 32KB 零拷贝缓冲
 
@@ -14,6 +14,7 @@ pub async fn pump_tcp_stream(
     mut server: TcpStream,
     cipher: CuteBiCipher,
     tcp_timeout: Duration,
+    initial_data: Vec<u8>,
 ) -> io::Result<()> {
     let (mut c_read, mut c_write) = client.split();
     let (mut s_read, mut s_write) = server.split();
@@ -23,8 +24,25 @@ pub async fn pump_tcp_stream(
 
     // 客户端 -> 目标服务器（解密方向）
     let c2s = async move {
-        let mut buf = vec![0u8; BUFFER_SIZE];
         let mut pass_sub = 0;
+
+        // 如果握手报文包含粘包的初始载荷，优先解密并转发
+        if !initial_data.is_empty() {
+            let mut init_buf = initial_data;
+            if !client_cipher.is_empty() {
+                pass_sub = client_cipher.crypt_in_place(&mut init_buf, pass_sub);
+            }
+            info!(
+                "Initial client payload forwarded ({} bytes): {:?}",
+                init_buf.len(),
+                String::from_utf8_lossy(&init_buf[..init_buf.len().min(64)])
+            );
+            timeout(tcp_timeout, s_write.write_all(&init_buf))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "initial write timed out"))??;
+        }
+
+        let mut buf = vec![0u8; BUFFER_SIZE];
         loop {
             let n = match timeout(tcp_timeout, c_read.read(&mut buf)).await {
                 Ok(Ok(0)) => break, // EOF
@@ -36,6 +54,12 @@ pub async fn pump_tcp_stream(
             if !client_cipher.is_empty() {
                 pass_sub = client_cipher.crypt_in_place(&mut buf[..n], pass_sub);
             }
+
+            info!(
+                "Client decrypted {} bytes to upstream: {:?}",
+                n,
+                String::from_utf8_lossy(&buf[..n.min(64)])
+            );
 
             timeout(tcp_timeout, s_write.write_all(&buf[..n]))
                 .await
@@ -57,7 +81,23 @@ pub async fn pump_tcp_stream(
                 Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "s2c read timed out")),
             };
 
+            info!(
+                "Upstream returned {} raw bytes: {:?}",
+                n,
+                String::from_utf8_lossy(&buf[..n.min(64)])
+            );
+
             if !server_cipher.is_empty() {
+                pass_sub = server_cipher.crypt_in_place(&mut buf[..n], pass_sub);
+            }
+
+            timeout(tcp_timeout, c_write.write_all(&buf[..n]))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "s2c write timed out"))??;
+        }
+        let _ = c_write.shutdown().await;
+        Ok::<(), io::Error>(())
+    };
                 pass_sub = server_cipher.crypt_in_place(&mut buf[..n], pass_sub);
             }
 

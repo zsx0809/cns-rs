@@ -113,8 +113,8 @@ async fn run_listener(
                 let cipher = cipher.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, parser, config, cipher).await {
-                        tracing::debug!("Client [{}] session finished: {}", peer_addr, e);
+                    if let Err(e) = handle_client(stream, peer_addr, parser, config, cipher).await {
+                        tracing::info!("Client [{}] session finished: {}", peer_addr, e);
                     }
                 });
             }
@@ -127,6 +127,7 @@ async fn run_listener(
 
 async fn handle_client(
     mut stream: TcpStream,
+    peer_addr: SocketAddr,
     parser: Arc<HandshakeParser>,
     config: Arc<Config>,
     cipher: CuteBiCipher,
@@ -146,12 +147,14 @@ async fn handle_client(
 
     match handshake.session_type {
         SessionType::Tcp { target_host } => {
+            info!("Establishing TCP tunnel for [{}] -> [{}]", peer_addr, target_host);
             let target_stream = DirectOutbound::dial_tcp(&target_host).await?;
             pump_tcp_stream(
                 stream,
                 target_stream,
                 cipher,
                 config.tcp_timeout_duration(),
+                handshake.remaining_data,
             )
             .await?;
         }

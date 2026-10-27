@@ -45,7 +45,12 @@ start_rules() {
     echo "✓ cns-client 已就绪 (PID: $PID, GID: 3004)"
 
     echo "⚙️ 注入内核数据包分流与防回环规则..."
-    for tool in iptables ip6tables; do
+    TOOLS="iptables"
+    if ip6tables -w -t nat -L >/dev/null 2>&1; then
+        TOOLS="iptables ip6tables"
+    fi
+
+    for tool in $TOOLS; do
         $tool -w -t nat -N CNS_NAT 2>/dev/null
         $tool -w -t nat -F CNS_NAT
 
@@ -90,7 +95,12 @@ start_rules() {
 
 stop_rules() {
     echo "🛑 正在关闭免流模式..."
-    for tool in iptables ip6tables; do
+    TOOLS="iptables"
+    if ip6tables -w -t nat -L >/dev/null 2>&1; then
+        TOOLS="iptables ip6tables"
+    fi
+
+    for tool in $TOOLS; do
         while $tool -w -t nat -D OUTPUT -j CNS_NAT 2>/dev/null; do :; done
         $tool -w -t nat -F CNS_NAT 2>/dev/null
         $tool -w -t nat -X CNS_NAT 2>/dev/null
@@ -156,11 +166,14 @@ run_tests() {
     HTTP_START=$(date +%s%3N 2>/dev/null || date +%s)
     HTTP_CODE=""
     if [ -n "$CURL_BIN" ]; then
-        HTTP_CODE=$($CURL_BIN -s -m 4 -o /dev/null -w "%{http_code}" http://connect.rom.miui.com/generate_204 2>/dev/null)
+        HTTP_CODE=$($CURL_BIN -s -m 8 -o /dev/null -w "%{http_code}" http://connect.rom.miui.com/generate_204 2>/dev/null)
+        if [ -z "$HTTP_CODE" ] || [ "$HTTP_CODE" = "000" ]; then
+            HTTP_CODE=$($CURL_BIN -s -m 8 -o /dev/null -w "%{http_code}" http://www.google.com/generate_204 2>/dev/null)
+        fi
     fi
     HTTP_END=$(date +%s%3N 2>/dev/null || date +%s)
     HTTP_TIME=$((HTTP_END - HTTP_START))
-    if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
+    if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
         echo "✓ 成功! 响应状态码: $HTTP_CODE (${HTTP_TIME}ms)"
     else
         echo "× 失败 (HTTP状态码: ${HTTP_CODE:-超时})"
@@ -171,11 +184,14 @@ run_tests() {
     HTTPS_START=$(date +%s%3N 2>/dev/null || date +%s)
     HTTPS_CODE=""
     if [ -n "$CURL_BIN" ]; then
-        HTTPS_CODE=$($CURL_BIN -k -s -m 5 -o /dev/null -w "%{http_code}" https://www.baidu.com 2>/dev/null)
+        HTTPS_CODE=$($CURL_BIN -k -s -m 8 -o /dev/null -w "%{http_code}" https://www.google.com 2>/dev/null)
+        if [ -z "$HTTPS_CODE" ] || [ "$HTTPS_CODE" = "000" ]; then
+            HTTPS_CODE=$($CURL_BIN -k -s -m 8 -o /dev/null -w "%{http_code}" https://www.baidu.com 2>/dev/null)
+        fi
     fi
     HTTPS_END=$(date +%s%3N 2>/dev/null || date +%s)
     HTTPS_TIME=$((HTTPS_END - HTTPS_START))
-    if [ "$HTTPS_CODE" = "200" ] || [ "$HTTPS_CODE" = "302" ]; then
+    if [ "$HTTPS_CODE" = "200" ] || [ "$HTTPS_CODE" = "302" ] || [ "$HTTPS_CODE" = "301" ]; then
         echo "✓ 成功! 握手及响应正常 (${HTTPS_TIME}ms)"
     else
         echo "× 失败 (响应码: ${HTTPS_CODE:-握手超时})"

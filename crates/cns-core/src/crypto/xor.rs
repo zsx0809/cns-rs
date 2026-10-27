@@ -177,4 +177,16 @@ mod tests {
         let decrypted = cipher.decrypt_host(encrypted_b64.as_bytes()).unwrap();
         assert_eq!(decrypted, original_host);
     }
+
+    #[test]
+    fn test_python_compatibility() {
+        let cipher = CuteBiCipher::new(b"tstkey");
+        let data = b"GET /generate_204 HTTP/1.1\r\nHost: connect.rom.miui.com\r\nConnection: close\r\n\r\n";
+        let mut buf = data.to_vec();
+        cipher.crypt_in_place(&mut buf, 0);
+        
+        let mask = [116u8, 115, 118, 107, 101, 125];
+        let expected: Vec<u8> = data.iter().enumerate().map(|(i, &b)| b ^ mask[i % mask.len()]).collect();
+        assert_eq!(buf, expected);
+    }
 }
