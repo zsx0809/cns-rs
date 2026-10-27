@@ -1,6 +1,6 @@
 use clap::Parser;
 use cns_client::config::ClientConfig;
-use cns_client::inbound::{apply_process_gid, get_original_dst, LocalDnsRelay, Socks5Command, Socks5Handshake};
+use cns_client::inbound::{apply_process_gid, get_original_dst, LocalDnsRelay, MicroTunRunner, Socks5Command, Socks5Handshake};
 use cns_client::outbound::CnsClientTunnel;
 use cns_core::crypto::CuteBiCipher;
 use cns_core::transport::{create_tcp_listener, tune_tcp_stream};
@@ -37,6 +37,10 @@ struct Args {
     /// Local UDP DNS relay listen address (e.g., 0.0.0.0:6653)
     #[arg(long = "dns-listen", default_value = "0.0.0.0:6653")]
     dns_listen: String,
+
+    /// Create and attach virtual TUN device (e.g., tunDev) for complete Android traffic takeover
+    #[arg(long = "tun")]
+    tun: Option<String>,
 }
 
 #[tokio::main]
@@ -149,6 +153,19 @@ async fn main() -> anyhow::Result<()> {
             }
         });
         info!("Local UDP DNS Relay listening on: {}", dns_addr);
+    }
+
+    // 4. 启动原生 Micro-TUN 虚拟网卡引擎 (如果指定了 --tun 参数)
+    if let Some(ref dev_name) = args.tun {
+        let cfg_tun = Arc::clone(&config_arc);
+        let cph_tun = Arc::clone(&cipher_arc);
+        let dev = dev_name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = MicroTunRunner::start(&dev, cfg_tun, cph_tun).await {
+                error!("Micro-TUN runner error: {}", e);
+            }
+        });
+        info!("Micro-TUN device [{}] requested and spawning async loop", dev_name);
     }
 
     info!("Upstream CNS Server: {}", config_arc.cns_server);
