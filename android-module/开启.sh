@@ -1,4 +1,10 @@
 #!/system/bin/sh
-# cns-rs 一键开启脚本 (自动启动 Micro-TUN 并执行全链路连通性检测)
+# cns-rs 一键开启脚本 (启动透明代理并执行全协议连通性健康检测)
+DIR="${0%/*}"
+cd "$DIR"
 
-su -c "\"${0%/*}/Core/cns_rules.sh\" start"
+if [ "$(id -u)" = "0" ]; then
+    "$DIR/Core/cns_rules.sh" start
+else
+    su -c "\"$DIR/Core/cns_rules.sh\" start"
+fi

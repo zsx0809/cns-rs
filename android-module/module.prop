@@ -1,0 +1,6 @@
+id=cns_rs
+name=cns-rs 现代化免流透明代理
+version=v0.1.0
+versionCode=100
+author=zsx0809
+description=基于 Rust 重构的高性能 CuteBi Network Suite 透明代理模块，零GC极速低功耗。模块安装路径: /data/adb/modules/cns_rs/。首次使用请修改 modes/联通.json 填入服务器IP与密码。

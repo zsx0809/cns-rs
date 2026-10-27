@@ -1,4 +1,12 @@
 #!/system/bin/sh
-# cns-rs 一键检测脚本 (查看运行状态并执行 DNS、HTTP、HTTPS、UDP 连通性测试)
+# cns-rs 一键检测脚本 (查看运行状态并执行全协议连通性检测)
+DIR="${0%/*}"
+cd "$DIR"
 
-su -c "\"${0%/*}/Core/cns_rules.sh\" status; echo ''; \"${0%/*}/Core/cns_rules.sh\" test"
+if [ "$(id -u)" = "0" ]; then
+    "$DIR/Core/cns_rules.sh" status
+    echo ""
+    "$DIR/Core/cns_rules.sh" test
+else
+    su -c "\"$DIR/Core/cns_rules.sh\" status; echo ''; \"$DIR/Core/cns_rules.sh\" test"
+fi
