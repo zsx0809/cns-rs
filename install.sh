@@ -185,7 +185,7 @@ svc_enable() {
 }
 
 show_banner() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${BLUE}"
     echo "=========================================================="
     echo "       cns-rs 极速免流服务端一键安装管理脚本              "
@@ -227,7 +227,7 @@ download_binary() {
     DOWNLOADED=false
     for URL in "${URLS[@]}"; do
         color_echo "$YELLOW" "尝试下载: $URL"
-        if curl -fSL --connect-timeout 10 --retry 2 "$URL" -o "$TMP_BIN"; then
+        if curl -fsSL --connect-timeout 10 --retry 2 "$URL" -o "$TMP_BIN"; then
             DOWNLOADED=true
             color_echo "$GREEN" "✓ 静态二进制下载完成！"
             break
@@ -439,6 +439,82 @@ modify_config() {
     color_echo "$GREEN" "✓ 配置文件已更新并重启服务！"
 }
 
+update_cns_server() {
+    check_root
+    detect_os
+    detect_arch
+    show_banner
+    color_echo "$BLUE" "🔍 正在检查 cns-server 服务端更新 (架构: ${TARGET_ARCH})..."
+
+    if [ ! -f "$BIN_PATH" ]; then
+        color_echo "$YELLOW" "未检测到已安装的 cns-server，将直接进入安装流程。"
+        install_cns_server
+        return
+    fi
+
+    CURRENT_VER=$("${BIN_PATH}" --version 2>/dev/null || echo "未知版本")
+    LOCAL_HASH=$(sha256sum "$BIN_PATH" 2>/dev/null | awk '{print $1}' || md5sum "$BIN_PATH" 2>/dev/null | awk '{print $1}' || echo "none")
+
+    echo -e "● 当前已安装版本: ${YELLOW}${CURRENT_VER}${PLAIN} (特征码: ${LOCAL_HASH:0:8})"
+
+    # 尝试多源获取最新远程静态二进制
+    URLS=(
+        "${GITHUB_RAW}/bin/cns-server-${TARGET_ARCH}"
+        "${GITHUB_PROXY_RAW}/bin/cns-server-${TARGET_ARCH}"
+        "https://github.com/zsx0809/cns-rs/releases/latest/download/cns-server-${TARGET_ARCH}"
+    )
+
+    TMP_BIN="/tmp/cns-server-update-${TARGET_ARCH}.$$"
+    DOWNLOADED=false
+    for URL in "${URLS[@]}"; do
+        color_echo "$YELLOW" "正在获取最新版本: $URL"
+        if curl -fsSL --connect-timeout 10 --retry 2 "$URL" -o "$TMP_BIN"; then
+            DOWNLOADED=true
+            break
+        fi
+    done
+
+    if [ "$DOWNLOADED" != "true" ] || [ ! -s "$TMP_BIN" ]; then
+        color_echo "$RED" "❌ 获取最新服务端版本失败，请检查网络连接。"
+        rm -f "$TMP_BIN"
+        return 1
+    fi
+
+    REMOTE_HASH=$(sha256sum "$TMP_BIN" 2>/dev/null | awk '{print $1}' || md5sum "$TMP_BIN" 2>/dev/null | awk '{print $1}' || echo "none2")
+    chmod +x "$TMP_BIN"
+    REMOTE_VER=$("$TMP_BIN" --version 2>/dev/null || echo "最新版本")
+
+    if [ "$LOCAL_HASH" = "$REMOTE_HASH" ] && [ "$LOCAL_HASH" != "none" ]; then
+        color_echo "$GREEN" "✓ 当前安装的服务端已经是最新版本，无需更新！"
+        echo ""
+        read -p "是否仍然强制重新替换并重启服务？(y/N): " FORCE_UPDATE
+        if [[ ! "$FORCE_UPDATE" =~ ^[Yy]$ ]]; then
+            rm -f "$TMP_BIN"
+            return 0
+        fi
+    else
+        color_echo "$GREEN" "🎉 检测到新版本服务端！准备执行平滑替换..."
+        echo -e "● 本地当前版本: ${YELLOW}${CURRENT_VER}${PLAIN} (${LOCAL_HASH:0:8})"
+        echo -e "● 远程最新版本: ${GREEN}${REMOTE_VER}${PLAIN} (${REMOTE_HASH:0:8})"
+    fi
+
+    color_echo "$BLUE" "正在替换旧服务端文件并重启服务..."
+    # 停止服务并使用 install 命令原子覆盖，避免 Text file busy
+    svc_stop 2>/dev/null || true
+    install -m 755 "$TMP_BIN" "$BIN_PATH"
+    rm -f "$TMP_BIN"
+
+    # 重启并显示状态
+    svc_restart
+    sleep 1
+
+    echo ""
+    color_echo "$GREEN" "=========================================================="
+    color_echo "$GREEN" "🎉 cns-server 服务端已成功更新并重启生效！"
+    color_echo "$GREEN" "=========================================================="
+    svc_status
+}
+
 uninstall_cns() {
     check_root
     detect_os
@@ -461,32 +537,52 @@ uninstall_cns() {
 main_menu() {
     show_banner
     echo -e " 1. ${GREEN}安装 cns-server 服务端${PLAIN}"
-    echo -e " 2. ${BLUE}启动服务${PLAIN}"
-    echo -e " 3. ${YELLOW}停止服务${PLAIN}"
-    echo -e " 4. ${BLUE}重启服务${PLAIN}"
-    echo -e " 5. 查看运行状态"
-    echo -e " 6. 查看实时日志"
-    echo -e " 7. 修改配置文件"
-    echo -e " 8. ${RED}彻底卸载 cns-server${PLAIN}"
+    echo -e " 2. ${GREEN}检测并更新 cns-server 服务端${PLAIN}"
+    echo -e " 3. ${BLUE}启动服务${PLAIN}"
+    echo -e " 4. ${YELLOW}停止服务${PLAIN}"
+    echo -e " 5. ${BLUE}重启服务${PLAIN}"
+    echo -e " 6. 查看运行状态"
+    echo -e " 7. 查看实时日志"
+    echo -e " 8. 修改配置文件"
+    echo -e " 9. ${RED}彻底卸载 cns-server${PLAIN}"
     echo -e " 0. 退出脚本"
     echo "----------------------------------------------------------"
-    read -p "请输入选项 [0-8]: " OPTION
+    read -p "请输入选项 [0-9]: " OPTION
     case "$OPTION" in
         1) install_cns_server ;;
-        2) start_service ;;
-        3) stop_service ;;
-        4) restart_service ;;
-        5) status_service ;;
-        6) view_logs ;;
-        7) modify_config ;;
-        8) uninstall_cns ;;
+        2) update_cns_server ;;
+        3) start_service ;;
+        4) stop_service ;;
+        5) restart_service ;;
+        6) status_service ;;
+        7) view_logs ;;
+        8) modify_config ;;
+        9) uninstall_cns ;;
         0) exit 0 ;;
         *) color_echo "$RED" "无效输入！" ;;
     esac
 }
 
-if [ "$1" = "install" ]; then
-    install_cns_server
-else
-    main_menu
-fi
+case "$1" in
+    install)
+        install_cns_server
+        ;;
+    update|upgrade)
+        update_cns_server
+        ;;
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        restart_service
+        ;;
+    status)
+        status_service
+        ;;
+    *)
+        main_menu
+        ;;
+esac

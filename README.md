@@ -69,6 +69,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zsx0809/cns-rs/main/install.
 * ✅ 交互式配置端口、密码与混淆 Host；
 * ✅ 自适应配置 systemd 或 OpenRC (Alpine) 后台守护开机自启；
 * ✅ 安装完成后自动生成客户端手机模块可一键复制的配置代码块！
+* ✅ **平滑在线检测与更新**：脚本菜单选择 `2` 或执行 `bash install.sh update` 即可毫秒级检测 GitHub 最新服务端并原子替换重启！
 
 ---
 
