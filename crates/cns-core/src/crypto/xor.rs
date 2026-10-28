@@ -41,6 +41,11 @@ impl CuteBiCipher {
         Self { mask_table }
     }
 
+    /// 构造空加密器（明文直通，不执行任何异或加解密）
+    pub fn empty() -> Self {
+        Self { mask_table: Vec::new() }
+    }
+
     /// 检查密码是否为空
     pub fn is_empty(&self) -> bool {
         self.mask_table.is_empty()

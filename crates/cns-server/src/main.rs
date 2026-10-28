@@ -172,8 +172,13 @@ async fn handle_client(
     let handshake = parser.parse(&header_buf)?;
 
     match handshake.session_type {
-        SessionType::Tcp { target_host } => {
-            tracing::debug!("Establishing TCP tunnel for [{}] -> [{}]", peer_addr, target_host);
+        SessionType::Tcp { target_host, is_encrypted } => {
+            tracing::debug!(
+                "Establishing TCP tunnel for [{}] -> [{}] (encrypted: {})",
+                peer_addr,
+                target_host,
+                is_encrypted
+            );
             let target_stream = timeout(DIAL_TIMEOUT, DirectOutbound::dial_tcp(&target_host))
                 .await
                 .map_err(|_| anyhow::anyhow!("Dial target host {} timed out", target_host))??;
@@ -182,10 +187,16 @@ async fn handle_client(
                 stream.write_all(&resp).await?;
             }
 
+            let session_cipher = if is_encrypted {
+                cipher
+            } else {
+                CuteBiCipher::empty()
+            };
+
             pump_tcp_stream(
                 stream,
                 target_stream,
-                cipher,
+                session_cipher,
                 config.tcp_timeout_duration(),
                 handshake.remaining_data,
             )

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 /// 客户端本地最大并发保护上限，避免系统应用突发高并发吃光 Android 内存
 const CLIENT_MAX_CONCURRENCY: usize = 2048;

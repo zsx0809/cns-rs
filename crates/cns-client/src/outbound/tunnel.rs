@@ -5,7 +5,6 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::debug;
 
 const BUFFER_SIZE: usize = 32 * 1024;
 
@@ -47,6 +46,18 @@ impl CnsClientTunnel {
             ));
         }
 
+        // 提取响应头后粘包跟随的 Server-First 初始数据（如目标 SSH 服务器率先推送的 SSH-2.0 Banner 等）
+        let initial_server_data = if let Some(pos) = resp_buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+            let remain_start = pos + 4;
+            if remain_start < n {
+                resp_buf[remain_start..n].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // 4. 双向流式原位异或数据泵
         let (mut local_read, mut local_write) = local_stream.split();
         let (mut server_read, mut server_write) = server_stream.split();
@@ -83,6 +94,18 @@ impl CnsClientTunnel {
         let server_to_local = async move {
             let mut buf = vec![0u8; BUFFER_SIZE];
             let mut pass_sub = 0;
+
+            // 优先解密并转发握手响应中附带的 Server-First 初始载荷（如 SSH Banner）
+            if !initial_server_data.is_empty() {
+                let mut init_buf = initial_server_data;
+                if !cipher_s2c.is_empty() {
+                    pass_sub = cipher_s2c.crypt_in_place(&mut init_buf, pass_sub);
+                }
+                timeout(timeout_dur, local_write.write_all(&init_buf))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Initial local write timed out"))??;
+            }
+
             loop {
                 let n = match timeout(timeout_dur, server_read.read(&mut buf)).await {
                     Ok(Ok(0)) => break,

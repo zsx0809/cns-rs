@@ -42,12 +42,17 @@ async fn test_full_pipeline_tcp_proxy() {
         client_stream.write_all(&handshake.response_header.unwrap()).await.unwrap();
 
         match handshake.session_type {
-            cns_core::protocol::SessionType::Tcp { target_host } => {
+            cns_core::protocol::SessionType::Tcp { target_host, is_encrypted } => {
                 let target_stream = TcpStream::connect(target_host).await.unwrap();
+                let session_cipher = if is_encrypted {
+                    cipher_server
+                } else {
+                    cns_core::crypto::CuteBiCipher::empty()
+                };
                 cns_server::tunnel::pump_tcp_stream(
                     client_stream,
                     target_stream,
-                    cipher_server,
+                    session_cipher,
                     Duration::from_secs(5),
                     handshake.remaining_data,
                 ).await.unwrap();
