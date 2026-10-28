@@ -32,13 +32,29 @@ impl CnsClientTunnel {
         let handshake_req = config.render_fake_header(&encrypted_target);
         server_stream.write_all(&handshake_req).await?;
 
-        // 3. 读取并校验服务端的 HTTP 握手响应
-        let mut resp_buf = [0u8; 1024];
-        let n = timeout(config.timeout(), server_stream.read(&mut resp_buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Handshake timed out"))??;
+        // 3. 严格流式读取并校验服务端的 HTTP 握手响应直到 \r\n\r\n
+        let mut resp_buf = Vec::with_capacity(1024);
+        let mut temp_buf = [0u8; 1024];
+        let mut header_end = None;
 
-        let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+        while header_end.is_none() {
+            let n = timeout(config.timeout(), server_stream.read(&mut temp_buf))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Handshake timed out"))??;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Connection closed by server during handshake"));
+            }
+            resp_buf.extend_from_slice(&temp_buf[..n]);
+            if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+            }
+            if resp_buf.len() > 8192 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Server response header too large"));
+            }
+        }
+
+        let end_idx = header_end.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_buf[..end_idx]);
         if !resp_str.starts_with("HTTP/1.1 200") && !resp_str.starts_with("HTTP/1.1 101") {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
@@ -47,13 +63,8 @@ impl CnsClientTunnel {
         }
 
         // 提取响应头后粘包跟随的 Server-First 初始数据（如目标 SSH 服务器率先推送的 SSH-2.0 Banner 等）
-        let initial_server_data = if let Some(pos) = resp_buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
-            let remain_start = pos + 4;
-            if remain_start < n {
-                resp_buf[remain_start..n].to_vec()
-            } else {
-                Vec::new()
-            }
+        let initial_server_data = if end_idx < resp_buf.len() {
+            resp_buf[end_idx..].to_vec()
         } else {
             Vec::new()
         };

@@ -157,55 +157,50 @@ async fn handle_client(
     config: Arc<Config>,
     cipher: CuteBiCipher,
 ) -> anyhow::Result<()> {
-    let mut header_buf = vec![0u8; 4096];
-    
-    // 带超时读取首个 HTTP 握手包，防止空连接永不释放耗尽 FD 和 RAM
-    let n = timeout(HANDSHAKE_TIMEOUT, stream.read(&mut header_buf))
-        .await
-        .map_err(|_| anyhow::anyhow!("Client handshake timed out"))??;
-        
-    if n == 0 {
-        return Ok(());
+    // 1. 严格循环流式读取完整 HTTP 请求头直到 \r\n\r\n (对齐原版 Go 循环读取逻辑，消除 4G/5G 网络 TCP 分包问题)
+    let mut header_buf = Vec::with_capacity(1024);
+    let mut temp_buf = [0u8; 1024];
+    loop {
+        let n = timeout(HANDSHAKE_TIMEOUT, stream.read(&mut temp_buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("Client handshake timed out"))??;
+        if n == 0 {
+            return Ok(());
+        }
+        header_buf.extend_from_slice(&temp_buf[..n]);
+
+        if !HandshakeParser::is_http_request(&header_buf) || header_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if header_buf.len() > 8192 {
+            return Err(anyhow::anyhow!("Handshake header too large"));
+        }
     }
-    header_buf.truncate(n);
 
     let handshake = parser.parse(&header_buf)?;
 
+    // 2. 关键时序（对齐原版 Go）：一解析完免流请求头，立刻向客户端回写 200 响应，使客户端状态机就绪
+    if let Some(ref resp) = handshake.response_header {
+        stream.write_all(resp).await?;
+    }
+
     match handshake.session_type {
-        SessionType::Tcp { target_host, is_encrypted } => {
-            tracing::debug!(
-                "Establishing TCP tunnel for [{}] -> [{}] (encrypted: {})",
-                peer_addr,
-                target_host,
-                is_encrypted
-            );
+        SessionType::Tcp { target_host } => {
+            tracing::debug!("Establishing TCP tunnel for [{}] -> [{}]", peer_addr, target_host);
             let target_stream = timeout(DIAL_TIMEOUT, DirectOutbound::dial_tcp(&target_host))
                 .await
                 .map_err(|_| anyhow::anyhow!("Dial target host {} timed out", target_host))??;
 
-            if let Some(resp) = handshake.response_header {
-                stream.write_all(&resp).await?;
-            }
-
-            let session_cipher = if is_encrypted {
-                cipher
-            } else {
-                CuteBiCipher::empty()
-            };
-
+            // 3. 对齐原版 Go：绝不向目标主动塞 handshake 的残余数据，全链路走免流异或加解密
             pump_tcp_stream(
                 stream,
                 target_stream,
-                session_cipher,
+                cipher,
                 config.tcp_timeout_duration(),
-                handshake.remaining_data,
             )
             .await?;
         }
         SessionType::Udp => {
-            if let Some(resp) = handshake.response_header {
-                stream.write_all(&resp).await?;
-            }
             let udp_socket = DirectOutbound::bind_udp(true).await?;
             let tunnel = UdpTunnel::new(
                 stream,
@@ -216,9 +211,6 @@ async fn handle_client(
             tunnel.run(handshake.remaining_data).await?;
         }
         SessionType::DnsTcpOverUdp { target_host } => {
-            if let Some(resp) = handshake.response_header {
-                stream.write_all(&resp).await?;
-            }
             handle_dns_tcp_over_udp(
                 stream,
                 &target_host,

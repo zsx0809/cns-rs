@@ -7,13 +7,12 @@ use tokio::time::timeout;
 
 const BUFFER_SIZE: usize = 32 * 1024; // 32KB 零拷贝缓冲
 
-/// TCP 双向流式原位异或数据泵 (零垃圾产生、高性能非阻塞传输)
+/// TCP 双向流式原位异或数据泵 (零垃圾产生、高性能非阻塞传输，完全对齐原版 Go 的 tcpForward 行为)
 pub async fn pump_tcp_stream(
     mut client: TcpStream,
     mut server: TcpStream,
     cipher: CuteBiCipher,
     tcp_timeout: Duration,
-    initial_data: Vec<u8>,
 ) -> io::Result<()> {
     let (mut c_read, mut c_write) = client.split();
     let (mut s_read, mut s_write) = server.split();
@@ -22,21 +21,10 @@ pub async fn pump_tcp_stream(
     let server_cipher = cipher;
 
     // 客户端 -> 目标服务器（解密方向）
+    // 严格对齐原版 Go：绝不主动向目标 SSH/TCP 服务器注入握手残余数据，保持目标服务纯净握手环境
     let c2s = async move {
-        let mut pass_sub = 0;
-
-        // 如果握手报文包含粘包的初始载荷，优先解密并转发
-        if !initial_data.is_empty() {
-            let mut init_buf = initial_data;
-            if !client_cipher.is_empty() {
-                pass_sub = client_cipher.crypt_in_place(&mut init_buf, pass_sub);
-            }
-            timeout(tcp_timeout, s_write.write_all(&init_buf))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "initial write timed out"))??;
-        }
-
         let mut buf = vec![0u8; BUFFER_SIZE];
+        let mut pass_sub = 0;
         loop {
             let n = match timeout(tcp_timeout, c_read.read(&mut buf)).await {
                 Ok(Ok(0)) => break, // EOF
@@ -58,6 +46,7 @@ pub async fn pump_tcp_stream(
     };
 
     // 目标服务器 -> 客户端（加密方向）
+    // 目标 SSH 服务器率先推送的 SSH-2.0-OpenSSH Banner 将被顺畅读取并流式加密送回客户端
     let s2c = async move {
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut pass_sub = 0;

@@ -43,19 +43,13 @@ async fn test_socks5_to_cns_server_end_to_end() {
         let handshake = parser.parse(&header_buf).unwrap();
         client_stream.write_all(&handshake.response_header.unwrap()).await.unwrap();
 
-        if let cns_core::protocol::SessionType::Tcp { target_host, is_encrypted } = handshake.session_type {
+        if let cns_core::protocol::SessionType::Tcp { target_host } = handshake.session_type {
             let target_stream = TcpStream::connect(target_host).await.unwrap();
-            let session_cipher = if is_encrypted {
-                server_cipher
-            } else {
-                cns_core::crypto::CuteBiCipher::empty()
-            };
             cns_server::tunnel::pump_tcp_stream(
                 client_stream,
                 target_stream,
-                session_cipher,
+                server_cipher,
                 Duration::from_secs(5),
-                handshake.remaining_data,
             )
             .await
             .unwrap();

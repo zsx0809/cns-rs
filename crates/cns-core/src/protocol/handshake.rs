@@ -3,11 +3,8 @@ use std::io;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SessionType {
-    /// 普通 TCP 隧道代理，附带解析出的目标 host (如 "example.com:443") 与是否启用异或加解密
-    Tcp {
-        target_host: String,
-        is_encrypted: bool,
-    },
+    /// 普通 TCP 隧道代理，附带解析出的规范化目标 host (如 "example.com:443" 或 "[2001:db8::1]:22")
+    Tcp { target_host: String },
     /// UDP 隧道会话 (httpUDP)
     Udp,
     /// DNS 优化查询 (:53 端口)
@@ -114,13 +111,12 @@ impl HandshakeParser {
         } else if header.starts_with(b"CON") {
             b"HTTP/1.1 200 Connection established\r\nServer: CuteBi Network Tunnel, (%>w<%)\r\nConnection: keep-alive\r\n\r\n".to_vec()
         } else {
-            b"HTTP/1.1 200 OK\r\nServer: CuteBi Network Tunnel, (%>w<%)\r\nConnection: keep-alive\r\n\r\n".to_vec()
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nServer: CuteBi Network Tunnel, (%>w<%)\r\nConnection: keep-alive\r\n\r\n".to_vec()
         }
     }
 
-    /// 提取目标地址并判定是否需要流式异或解密
-    /// 返回 Option<(规范化后的目标地址, 是否走 CuteBi 异或加密)>
-    pub fn extract_target(&self, header: &[u8]) -> Option<(String, bool)> {
+    /// 从 HTTP 请求头中提取并规范化目标主机地址 (对齐原版 Go 的 getProxyHost 语义)
+    pub fn extract_target(&self, header: &[u8]) -> Option<String> {
         // 1. 优先从专用免流头 (如 Proxy-Key: Meng) 提取
         let pattern = format!("\n{}: ", self.proxy_key);
         let pattern_bytes = pattern.as_bytes();
@@ -140,38 +136,33 @@ impl HandshakeParser {
 
         if let Some(raw_val) = proxy_val {
             if !raw_val.is_empty() {
-                // 如果配置了加密密钥，尝试解密
+                // 如果配置了加密密钥，解密 Host
                 if !self.cipher.is_empty() {
                     if let Ok(decrypted) = self.cipher.decrypt_host(raw_val) {
-                        return Some((normalize_target_host(&decrypted), true));
+                        return Some(normalize_target_host(&decrypted));
                     }
-                }
-                // 若无密码或解密失败但为可读明文（如明文配置），作为免加密直通模式
-                if let Ok(plain_host) = String::from_utf8(raw_val.to_vec()) {
+                } else if let Ok(plain_host) = String::from_utf8(raw_val.to_vec()) {
                     let trimmed = plain_host.trim();
                     if !trimmed.is_empty() {
-                        return Some((normalize_target_host(trimmed), false));
+                        return Some(normalize_target_host(trimmed));
                     }
                 }
             }
         }
 
-        // 2. 回退机制：标准 HTTP CONNECT 请求行 (解决安卓 SSH 客户端等通过 HTTP Proxy 直连)
-        // 典型格式: CONNECT 127.0.0.1:22 HTTP/1.1 或 CONNECT [2001:db8::1]:22 HTTP/1.1
+        // 2. 回退机制：从 CONNECT 请求行或 Host 提取目标
         if header.starts_with(b"CONNECT ") {
             let rest = &header[8..];
             if let Some(space_pos) = rest.iter().position(|&b| b == b' ' || b == b'\r' || b == b'\n') {
                 if let Ok(connect_target) = String::from_utf8(rest[..space_pos].to_vec()) {
                     let trimmed = connect_target.trim();
                     if !trimmed.is_empty() {
-                        // 标准 CONNECT 协议客户端不支持私有异或变换，采用纯透明直通
-                        return Some((normalize_target_host(trimmed), false));
+                        return Some(normalize_target_host(trimmed));
                     }
                 }
             }
         }
 
-        // 3. 回退机制：标准 Host 头部 (若存在端口)
         let host_pattern = b"\nHost: ";
         if let Some(pos) = header
             .windows(host_pattern.len())
@@ -186,7 +177,7 @@ impl HandshakeParser {
             if let Ok(host_val) = String::from_utf8(header[start..end].to_vec()) {
                 let trimmed = host_val.trim();
                 if trimmed.contains(':') && !trimmed.contains("alipay.com") && !trimmed.contains("10010.com") {
-                    return Some((normalize_target_host(trimmed), false));
+                    return Some(normalize_target_host(trimmed));
                 }
             }
         }
@@ -240,8 +231,8 @@ impl HandshakeParser {
             });
         }
 
-        // 解析目标 Host 与加解密模式
-        let (formatted_host, is_encrypted) = self.extract_target(header_slice).ok_or_else(|| {
+        // 解析目标 Host
+        let formatted_host = self.extract_target(header_slice).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Failed to parse target host from HTTP header")
         })?;
 
@@ -255,7 +246,6 @@ impl HandshakeParser {
             Ok(HandshakeResult {
                 session_type: SessionType::Tcp {
                     target_host: formatted_host,
-                    is_encrypted,
                 },
                 response_header: Some(resp),
                 remaining_data: remaining.to_vec(),
@@ -285,9 +275,8 @@ mod tests {
         let connect_req = b"CONNECT 2001:db8::1:22 HTTP/1.1\r\nHost: 2001:db8::1:22\r\nUser-Agent: Termius\r\n\r\n";
         let res = parser.parse(connect_req).unwrap();
         match res.session_type {
-            SessionType::Tcp { target_host, is_encrypted } => {
+            SessionType::Tcp { target_host } => {
                 assert_eq!(target_host, "[2001:db8::1]:22");
-                assert_eq!(is_encrypted, false);
             }
             _ => panic!("Expected TCP session"),
         }
@@ -304,11 +293,12 @@ mod tests {
         let req = format!("GET / HTTP/1.1\r\nHost: mclient.alipay.com\r\nMeng: {}\r\n\r\n", enc_host);
         let res = parser.parse(req.as_bytes()).unwrap();
         match res.session_type {
-            SessionType::Tcp { target_host, is_encrypted } => {
+            SessionType::Tcp { target_host } => {
                 assert_eq!(target_host, "1.1.1.1:443");
-                assert_eq!(is_encrypted, true);
             }
             _ => panic!("Expected TCP session"),
         }
+        let resp_str = String::from_utf8(res.response_header.unwrap()).unwrap();
+        assert!(resp_str.contains("Transfer-Encoding: chunked"));
     }
 }
