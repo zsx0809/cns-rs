@@ -49,6 +49,7 @@ async fn test_full_pipeline_tcp_proxy() {
                     target_stream,
                     cipher_server,
                     Duration::from_secs(5),
+                    handshake.remaining_data,
                 ).await.unwrap();
             }
             _ => panic!("Expected TCP session"),

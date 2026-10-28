@@ -171,16 +171,16 @@ async fn handle_client(
 
     let handshake = parser.parse(&header_buf)?;
 
-    if let Some(resp) = handshake.response_header {
-        stream.write_all(&resp).await?;
-    }
-
     match handshake.session_type {
         SessionType::Tcp { target_host } => {
             tracing::debug!("Establishing TCP tunnel for [{}] -> [{}]", peer_addr, target_host);
             let target_stream = timeout(DIAL_TIMEOUT, DirectOutbound::dial_tcp(&target_host))
                 .await
                 .map_err(|_| anyhow::anyhow!("Dial target host {} timed out", target_host))??;
+
+            if let Some(resp) = handshake.response_header {
+                stream.write_all(&resp).await?;
+            }
 
             pump_tcp_stream(
                 stream,
@@ -192,6 +192,9 @@ async fn handle_client(
             .await?;
         }
         SessionType::Udp => {
+            if let Some(resp) = handshake.response_header {
+                stream.write_all(&resp).await?;
+            }
             let udp_socket = DirectOutbound::bind_udp(true).await?;
             let tunnel = UdpTunnel::new(
                 stream,
@@ -202,6 +205,9 @@ async fn handle_client(
             tunnel.run(handshake.remaining_data).await?;
         }
         SessionType::DnsTcpOverUdp { target_host } => {
+            if let Some(resp) = handshake.response_header {
+                stream.write_all(&resp).await?;
+            }
             handle_dns_tcp_over_udp(
                 stream,
                 &target_host,

@@ -57,16 +57,17 @@ Android 11+ 内核网络栈对 DNS 响应的校验极其严格。传统代理回
 
 ## ⚡ 一键极速部署（Linux VPS 云服务器）
 
-在你的 Linux VPS 上直接运行以下官方一键命令（支持 Debian / Ubuntu / CentOS / Alpine / Rocky 等）：
+在你的 Linux VPS 上直接运行以下官方一键安装命令（动态识别并支持 **Ubuntu / Debian / Alpine / CentOS / AlmaLinux / Rocky / Fedora / Arch** 等主流发行版，纯静态免依赖，无需在 VPS 上编译）：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/zsx0809/cns-rs/main/install.sh)
 ```
 
 脚本全自动引导：
-* ✅ 智能架构识别与部署；
+* ✅ 智能操作系统与硬件架构（`x86_64` / `aarch64`）识别；
+* ✅ 自动安装全平台通用纯静态二进制服务端，128MB/500MB 超低内存小鸡亦能秒级完成部署；
 * ✅ 交互式配置端口、密码与混淆 Host；
-* ✅ 自动配置守护进程开机自启、日志速率与磁盘限额保护；
+* ✅ 自适应配置 systemd 或 OpenRC (Alpine) 后台守护开机自启；
 * ✅ 安装完成后自动生成客户端手机模块可一键复制的配置代码块！
 
 ---
@@ -77,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zsx0809/cns-rs/main/install.
 
 ### 1. 下载模块刷机包
 前往 [GitHub Releases](https://github.com/zsx0809/cns-rs/releases/latest) 下载最新发布的：
-👉 **`cns-rs-v0.1.0-magisk-ksu-arm64.zip`**
+👉 **`cns-rs-v0.1.1-magisk-ksu-arm64.zip`**
 直接在 **Magisk**、**KernelSU** 或 **APatch** 管理器中刷入！
 
 ### 2. 模块主目录路径
