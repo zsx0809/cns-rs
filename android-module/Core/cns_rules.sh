@@ -404,8 +404,12 @@ run_tests() {
     elif [ -z "$SERVER_HOST" ] || [ -z "$SERVER_PORT" ]; then
         echo "× 未解析到服务端地址"
     else
-        # 任意 HTTP 响应（含 4xx/5xx）都代表端口可达；000 才是连不上
-        C=$(probe "http://$SERVER_HOST:$SERVER_PORT/" 5)
+        # 任意 HTTP 响应（含 4xx/5xx）都代表端口可达；000 才是连不上（IPv6 地址须加方括号）
+        _target_host="$SERVER_HOST"
+        case "$_target_host" in
+            *:*) _target_host="[$_target_host]" ;;
+        esac
+        C=$(probe "http://$_target_host:$SERVER_PORT/" 5)
         case "$C" in
             000|skip) echo "× $SERVER_HOST:$SERVER_PORT 不可达（检查防火墙与 cns_server 配置）" ;;
             *) echo "✓ $SERVER_HOST:$SERVER_PORT 可达" ;;
