@@ -338,16 +338,27 @@ EOF
     setup_service
     svc_restart
 
-    # 6. 获取服务器公网 IP (兼容 IPv4/IPv6，单 IPv6 环境优先使用物理网卡公网 IP)
-    SERVER_IP=$(curl -s4 --connect-timeout 2 https://api.ipify.org 2>/dev/null || \
-                curl -s6 --connect-timeout 2 https://api64.ipify.org 2>/dev/null || \
-                ip -6 addr show scope global 2>/dev/null | grep -E "inet6 2[0-9a-f]{3}:" | awk '{print $2}' | cut -d/ -f1 | head -n 1 || \
-                echo "你的服务器公网IP")
+    # 6. 获取服务器真实可访问的公网 IP / 节点地址
+    # 策略：优先判断物理网卡是否存在真正的公网 IPv4（排除 RFC1918 私网如 192.168/10/172 等）
+    LOCAL_IPV4=$(ip -4 addr show scope global 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' | grep -vE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.)' | head -n 1 || true)
+    LOCAL_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep -o 'inet6 [0-9a-f:]*' | awk '{print $2}' | grep -E '^2[0-9a-f]{3}:' | head -n 1 || true)
 
-    if [[ "$SERVER_IP" =~ : ]]; then
+    if [ -n "$LOCAL_IPV4" ]; then
+        SERVER_IP="$LOCAL_IPV4"
+        SERVER_ENDPOINT="${SERVER_IP}:${LISTEN_PORT}"
+    elif [ -n "$LOCAL_IPV6" ]; then
+        SERVER_IP="$LOCAL_IPV6"
         SERVER_ENDPOINT="[${SERVER_IP}]:${LISTEN_PORT}"
     else
-        SERVER_ENDPOINT="${SERVER_IP}:${LISTEN_PORT}"
+        # 兜底查询公网 API
+        SERVER_IP=$(curl -s4 --connect-timeout 2 https://api.ipify.org 2>/dev/null || \
+                    curl -s6 --connect-timeout 2 https://api64.ipify.org 2>/dev/null || \
+                    echo "你的服务器公网IP")
+        if [[ "$SERVER_IP" =~ : ]]; then
+            SERVER_ENDPOINT="[${SERVER_IP}]:${LISTEN_PORT}"
+        else
+            SERVER_ENDPOINT="${SERVER_IP}:${LISTEN_PORT}"
+        fi
     fi
 
     echo ""
