@@ -1,229 +1,119 @@
 use clap::Parser;
-use cns_core::crypto::CuteBiCipher;
-use cns_core::protocol::{HandshakeParser, SessionType};
-use cns_core::transport::{create_tcp_listener, tune_tcp_stream};
 use cns_server::config::Config;
-use cns_server::outbound::DirectOutbound;
-use cns_server::tunnel::{handle_dns_tcp_over_udp, handle_http_dns, pump_tcp_stream, UdpTunnel};
-use std::net::SocketAddr;
+use cns_server::serve::{bind_listeners, run_listener, ServerCtx};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
-
-/// 最大并发 TCP 连接配额，彻底杜绝连接风暴与内存暴涨 (OOM) 风险
-const MAX_CONCURRENT_CONNECTIONS: usize = 4096;
-/// 客户端首包握手必须在 10 秒内送达，超时强制丢弃防 Slowloris 挂死连接
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// 回源连接建立超时限制
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(
     name = "cns-server",
     author = "CuteBi Modernizers",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Ultra-high-performance, zero-GC CuteBi Network Suite (CNS) server in pure Rust"
 )]
 struct Args {
     /// Path to JSON configuration file
     #[arg(short = 'c', long = "config", alias = "json", default_value = "config.json")]
     config: String,
+
+    /// 配置缺失或损坏时仍用内置默认值启动。默认口令为空 = 明文，仅供本机调试。
+    #[arg(long)]
+    allow_defaults: bool,
+
+    /// 覆盖监听地址（可重复），如 --listen 0.0.0.0:1254
+    #[arg(short = 'l', long = "listen")]
+    listen: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 生产环境安全日志：默认仅输出 warn 及以上日志，避免大量并发请求刷爆 VPS 磁盘
+    // 生产环境安全日志：默认 warn 以上，避免热路径刷爆 VPS 磁盘
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
     let args = Args::parse();
-    info!("Loading configuration from: {}", args.config);
 
-    let config = match Config::from_file(&args.config) {
+    // 关键修复：配置错误必须 fail-fast。
+    // 旧实现解析失败后静默使用默认配置，而默认 encrypt_password 为空 = 明文开放代理。
+    let mut config = match Config::from_file(&args.config) {
         Ok(cfg) => cfg,
-        Err(e) => {
-            warn!("Failed to read {}: {}. Falling back to default configuration.", args.config, e);
+        Err(e) if args.allow_defaults => {
+            warn!("{e}");
+            warn!("--allow-defaults given: starting with built-in defaults (UNSECURED).");
             Config::default()
+        }
+        Err(e) => {
+            error!("{e}");
+            return Err(e);
         }
     };
 
-    let cipher = CuteBiCipher::new(config.encrypt_password.as_bytes());
-    let parser = Arc::new(HandshakeParser::new(
-        &config.proxy_key,
-        &config.udp_flag,
-        cipher.clone(),
-        config.enable_dns_tcp_over_udp,
-    ));
+    if !args.listen.is_empty() {
+        config.listen_addr = args.listen.clone();
+    }
+
+    if config.encrypt_password.is_empty() {
+        warn!("encrypt_password is EMPTY — traffic is plain HTTP-visible. Set a password.");
+    }
+    if config.allow_private_targets {
+        warn!("allow_private_targets=true — this server can reach private networks.");
+    }
 
     info!(
-        "CuteBi Network Suite Server starting up. Cipher loaded: {}",
-        !cipher.is_empty()
+        "cns-server {} starting (cipher={}, tfo={}, httpdns={}, per_ip_limit={})",
+        env!("CARGO_PKG_VERSION"),
+        !config.encrypt_password.is_empty(),
+        config.enable_tfo,
+        config.enable_httpdns,
+        config.max_connections_per_ip
     );
 
-    let config_arc = Arc::new(config);
-    let conn_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-
-    for addr_str in &config_arc.listen_addr {
-        let normalized_addr = if addr_str.starts_with(':') {
-            format!("[::]{}", addr_str)
-        } else {
-            addr_str.clone()
-        };
-
-        let socket_addr: SocketAddr = match normalized_addr.parse() {
-            Ok(addr) => addr,
-            Err(_) => {
-                let v4_fallback = format!("0.0.0.0{}", addr_str);
-                match v4_fallback.parse() {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        error!("Invalid listen address '{}': {}", addr_str, e);
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let listener = create_tcp_listener(socket_addr, config_arc.enable_tfo)?;
-        info!("Listening on TCP: {}", socket_addr);
-
-        let parser_clone = Arc::clone(&parser);
-        let config_clone = Arc::clone(&config_arc);
-        let cipher_clone = cipher.clone();
-        let sem_clone = Arc::clone(&conn_semaphore);
-
-        tokio::spawn(async move {
-            run_listener(listener, parser_clone, config_clone, cipher_clone, sem_clone).await;
-        });
+    let ctx = Arc::new(ServerCtx::new(config));
+    let listeners = bind_listeners(&ctx.config);
+    if listeners.is_empty() {
+        anyhow::bail!("no listener could be bound; check listen_addr and permissions");
     }
 
-    tokio::signal::ctrl_c().await?;
-    info!("Shutdown signal received. Exiting gracefully...");
+    let mut handles = Vec::new();
+    for bound in listeners {
+        let c = Arc::clone(&ctx);
+        handles.push(tokio::spawn(run_listener(bound.listener, c)));
+    }
 
-    Ok(())
-}
-
-async fn run_listener(
-    listener: TcpListener,
-    parser: Arc<HandshakeParser>,
-    config: Arc<Config>,
-    cipher: CuteBiCipher,
-    semaphore: Arc<Semaphore>,
-) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                tune_tcp_stream(&stream);
-                let permit = match semaphore.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // 达到最大并发上限，主动关闭连接，保护系统内存不 OOM
-                        warn!("Max concurrency limit ({}) reached, rejecting connection from {}", MAX_CONCURRENT_CONNECTIONS, peer_addr);
-                        drop(stream);
-                        continue;
-                    }
-                };
-
-                let parser = Arc::clone(&parser);
-                let config = Arc::clone(&config);
-                let cipher = cipher.clone();
-
-                tokio::spawn(async move {
-                    let _permit = permit; // 任务结束自动释放并发许可
-                    if let Err(e) = handle_client(stream, peer_addr, parser, config, cipher).await {
-                        tracing::debug!("Client [{}] session finished: {}", peer_addr, e);
-                    }
-                });
-            }
-            Err(e) => {
-                warn!("Listener accept error: {}", e);
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => {
+            if let Err(e) = res {
+                error!("signal handler error: {e}");
             }
         }
-    }
-}
-
-async fn handle_client(
-    mut stream: TcpStream,
-    peer_addr: SocketAddr,
-    parser: Arc<HandshakeParser>,
-    config: Arc<Config>,
-    cipher: CuteBiCipher,
-) -> anyhow::Result<()> {
-    // 1. 严格循环流式读取完整 HTTP 请求头直到 \r\n\r\n (对齐原版 Go 循环读取逻辑，消除 4G/5G 网络 TCP 分包问题)
-    let mut header_buf = Vec::with_capacity(1024);
-    let mut temp_buf = [0u8; 1024];
-    loop {
-        let n = timeout(HANDSHAKE_TIMEOUT, stream.read(&mut temp_buf))
-            .await
-            .map_err(|_| anyhow::anyhow!("Client handshake timed out"))??;
-        if n == 0 {
-            return Ok(());
-        }
-        header_buf.extend_from_slice(&temp_buf[..n]);
-
-        if !HandshakeParser::is_http_request(&header_buf) || header_buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if header_buf.len() > 8192 {
-            return Err(anyhow::anyhow!("Handshake header too large"));
-        }
+        _ = ctx.shutdown.notified() => {}
     }
 
-    let handshake = parser.parse(&header_buf)?;
+    info!("shutdown requested, draining {} active sessions", ctx.active_sessions());
+    ctx.shutdown.notify_waiters();
 
-    // 2. 关键时序（对齐原版 Go）：一解析完免流请求头，立刻向客户端回写 200 响应，使客户端状态机就绪
-    if let Some(ref resp) = handshake.response_header {
-        stream.write_all(resp).await?;
+    // 给在途连接一个排水窗口，超时才硬收
+    let drain = Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    while ctx.active_sessions() > 0 && started.elapsed() < drain {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
-    match handshake.session_type {
-        SessionType::Tcp { target_host } => {
-            tracing::debug!("Establishing TCP tunnel for [{}] -> [{}]", peer_addr, target_host);
-            let target_stream = timeout(DIAL_TIMEOUT, DirectOutbound::dial_tcp(&target_host))
-                .await
-                .map_err(|_| anyhow::anyhow!("Dial target host {} timed out", target_host))??;
-
-            // 3. 对齐原版 Go：绝不向目标主动塞 handshake 的残余数据，全链路走免流异或加解密
-            pump_tcp_stream(
-                stream,
-                target_stream,
-                cipher,
-                config.tcp_timeout_duration(),
-            )
-            .await?;
-        }
-        SessionType::Udp => {
-            let udp_socket = DirectOutbound::bind_udp(true).await?;
-            let tunnel = UdpTunnel::new(
-                stream,
-                udp_socket,
-                cipher,
-                config.udp_timeout_duration(),
-            );
-            tunnel.run(handshake.remaining_data).await?;
-        }
-        SessionType::DnsTcpOverUdp { target_host } => {
-            handle_dns_tcp_over_udp(
-                stream,
-                &target_host,
-                cipher,
-                config.udp_timeout_duration(),
-                handshake.remaining_data,
-            )
-            .await?;
-        }
-        SessionType::HttpDns { domain, is_ipv6 } => {
-            handle_http_dns(stream, &domain, is_ipv6).await?;
-        }
+    let left = ctx.active_sessions();
+    if left > 0 {
+        warn!("drain window elapsed with {left} sessions still open");
     }
+    let join_all = async move {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    let _ = timeout(Duration::from_secs(1), join_all).await;
 
+    info!("cns-server stopped (served {} sessions total)", ctx.total_sessions());
     Ok(())
 }

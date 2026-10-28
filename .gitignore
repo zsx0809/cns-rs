@@ -1,11 +1,27 @@
 /target
-Cargo.lock
+
+# Cargo.lock 必须入库：本项目是 binary 工作区，锁死依赖版本才能让
+# 「Releases 里的静态二进制」与「用户本地编译」产出行为一致。
 
 # Private mode configs
 android-module/modes/美国.json
 android-module/modes/英国.json
 *.secret.json
 
+# 模块包与校验清单随 release 发布，不进版本库历史（二进制体积大且每次重编都变）
 *.zip
-!cns-rs-v0.1.1-magisk-ksu-arm64.zip
+*.zip.sha256
 
+
+# 本地构建配置：镜像源/链接器因人而异，不入库
+.cargo/
+
+# 产物：根目录三件套必须入库（install.sh 与 README 下载链接直接指向它们）
+!/cns-server-x86_64
+!/cns-server-aarch64
+!/cns-client-aarch64
+
+# 校验清单由 build.sh 生成，必须入库供 install.sh 校验使用
+!sha256sums.txt
+!*.sha256
+!cns-rs-v0.1.1-magisk-ksu-arm64.zip

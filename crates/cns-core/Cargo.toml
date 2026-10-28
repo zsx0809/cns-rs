@@ -1,16 +1,19 @@
 [package]
 name = "cns-core"
-version = "0.1.0"
-edition = "2021"
-authors = ["CuteBi Modernizers"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared protocol, cipher and transport primitives for cns-rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
-bytes = "1"
-socket2 = { version = "0.5", features = ["all"] }
-base64 = "0.22"
-thiserror = "2"
-tracing = "0.1"
-anyhow = "1"
-libc = "0.2"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+socket2 = { workspace = true }
+base64 = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }

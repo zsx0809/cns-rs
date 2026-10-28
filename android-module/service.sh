@@ -1,6 +1,8 @@
 #!/system/bin/sh
 # cns-rs 开机服务调度脚本
 MODDIR="${0%/*}"
+# 默认值：即使 config.ini 缺失也能安全运行
+autoStart='0'
 
 # 等待系统引导就绪
 while [ "$(getprop sys.boot_completed)" != "1" ]; do

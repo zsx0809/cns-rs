@@ -1,0 +1,7 @@
+# 固定开发/CI 工具链版本。
+# 注意：本文件只对 rustup 管理的 cargo 生效；本项目在 Termux chroot 里用的是
+# 独立 sysroot（/opt/rust199）与 Termux 自带 cargo，它们会忽略此文件，
+# 因此不会影响本地构建 —— 已实测确认。
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]

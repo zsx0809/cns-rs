@@ -6,9 +6,60 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["CuteBi Modernizers <zsx0809>"]
+license = "MIT"
+repository = "https://github.com/zsx0809/cns-rs"
+
+# 依赖统一在 workspace 声明，三个 crate 只写 `workspace = true`：
+# 避免版本漂移，也让 cargo 只编译一份依赖（Termux 上编译时间差好几倍）。
+[workspace.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-util",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+socket2 = { version = "0.5", features = ["all"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+    "ansi",
+    "std",
+] }
+anyhow = "1"
+libc = "0.2"
+
+# 内部 crate
+cns-core = { path = "crates/cns-core" }
+cns-server = { path = "crates/cns-server" }
+cns-client = { path = "crates/cns-client" }
+
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true
+# 不用 panic=abort：单条连接的 panic 只杀掉那个 task，服务端继续服务，
+# 手机端也没有 supervisor 能把它拉起来。多出来的 unwind 表已由 strip 压掉大半。
+panic = "unwind"
