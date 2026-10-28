@@ -153,9 +153,9 @@ svc_restart() {
     if [ "$INIT_SYSTEM" = "systemd" ]; then
         systemctl restart cns-server
     elif [ "$INIT_SYSTEM" = "openrc" ]; then
-        rc-service cns-server restart
+        rc-service cns-server restart 2>/dev/null || rc-service cns-server start
     else
-        svc_stop
+        svc_stop 2>/dev/null || true
         sleep 1
         svc_start
     fi
@@ -223,10 +223,11 @@ download_binary() {
         "https://github.com/zsx0809/cns-rs/releases/latest/download/cns-server-${TARGET_ARCH}"
     )
 
+    TMP_BIN="/tmp/cns-server-${TARGET_ARCH}.$$"
     DOWNLOADED=false
     for URL in "${URLS[@]}"; do
         color_echo "$YELLOW" "尝试下载: $URL"
-        if curl -fSL --connect-timeout 10 --retry 2 "$URL" -o "$BIN_PATH"; then
+        if curl -fSL --connect-timeout 10 --retry 2 "$URL" -o "$TMP_BIN"; then
             DOWNLOADED=true
             color_echo "$GREEN" "✓ 静态二进制下载完成！"
             break
@@ -235,10 +236,14 @@ download_binary() {
 
     if [ "$DOWNLOADED" != "true" ]; then
         color_echo "$RED" "❌ 无法自动下载预构建二进制，请检查网络连接。"
+        rm -f "$TMP_BIN"
         exit 1
     fi
 
-    chmod +x "$BIN_PATH"
+    # 停止旧服务并使用 install 命令进行原子覆盖，避免运行中写入触发 'Text file busy'
+    svc_stop 2>/dev/null || true
+    install -m 755 "$TMP_BIN" "$BIN_PATH"
+    rm -f "$TMP_BIN"
 }
 
 setup_service() {
@@ -333,8 +338,17 @@ EOF
     setup_service
     svc_restart
 
-    # 6. 获取服务器公网 IP
-    SERVER_IP=$(curl -s4 --connect-timeout 3 https://api.ipify.org 2>/dev/null || curl -s6 --connect-timeout 3 https://api64.ipify.org 2>/dev/null || echo "你的服务器公网IP")
+    # 6. 获取服务器公网 IP (兼容 IPv4/IPv6，单 IPv6 环境优先使用物理网卡公网 IP)
+    SERVER_IP=$(curl -s4 --connect-timeout 2 https://api.ipify.org 2>/dev/null || \
+                curl -s6 --connect-timeout 2 https://api64.ipify.org 2>/dev/null || \
+                ip -6 addr show scope global 2>/dev/null | grep -E "inet6 2[0-9a-f]{3}:" | awk '{print $2}' | cut -d/ -f1 | head -n 1 || \
+                echo "你的服务器公网IP")
+
+    if [[ "$SERVER_IP" =~ : ]]; then
+        SERVER_ENDPOINT="[${SERVER_IP}]:${LISTEN_PORT}"
+    else
+        SERVER_ENDPOINT="${SERVER_IP}:${LISTEN_PORT}"
+    fi
 
     echo ""
     color_echo "$GREEN" "=========================================================="
@@ -351,7 +365,7 @@ EOF
     color_echo "$YELLOW" "📱 客户端 (Android 免流模块) 节点配置请填写:"
     echo "----------------------------------------------------------"
     echo -e "{"
-    echo -e "  \"cns_server\": \"${SERVER_IP}:${LISTEN_PORT}\","
+    echo -e "  \"cns_server\": \"${SERVER_ENDPOINT}\","
     echo -e "  \"cns_password\": \"${CNS_PASSWORD}\","
     echo -e "  \"proxy_key\": \"${PROXY_KEY}\","
     echo -e "  \"header_host\": \"${HEADER_HOST}\""
