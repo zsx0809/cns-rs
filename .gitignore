@@ -25,3 +25,6 @@ android-module/modes/英国.json
 !sha256sums.txt
 !*.sha256
 !cns-rs-v0.1.1-magisk-ksu-arm64.zip
+
+# Android 交叉编译目录（scripts/build.sh 产出，勿入库）
+/target-android

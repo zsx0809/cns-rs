@@ -1,3 +1,4 @@
+use crate::transport::mss;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
@@ -19,6 +20,17 @@ pub struct ListenOptions {
     pub recv_buffer: usize,
     pub send_buffer: usize,
     pub backlog: u32,
+    /// 目标链路 MTU（字节），0 = 不钳制。
+    ///
+    /// 实际下发的 `TCP_MAXSEG` 由地址族决定：IPv4 = MTU−40，IPv6 = MTU−60
+    /// （见 `mss::mss_for_mtu`）。同一个 `[::]:port` 监听既吃 v4 又吃 v6，
+    /// 所以取**更保守的 v6 口径**，避免 v4 侧算出 1310 而 v6 侧真实需求只有 1290。
+    ///
+    /// 必须在 bind/listen **之前**设置：内核在建链时快照一次，之后再设只影响
+    /// 后续新连接，而 MTU 黑洞杀的正是首包之后的大包 —— 设晚了等于没设。
+    /// 这台内核没有 `xt_TCPMSS`（`iptables -j TCPMSS` 报 No chain/target/match），
+    /// 所以这是唯一的 MSS 落点，详见 `transport::mss` 的模块注释。
+    pub tun_mtu: u16,
 }
 
 impl Default for ListenOptions {
@@ -30,6 +42,8 @@ impl Default for ListenOptions {
             recv_buffer: 4 * 1024 * 1024,
             send_buffer: 4 * 1024 * 1024,
             backlog: 4096,
+            // 默认不钳制：由部署方按现场链路 MTU 显式给值（客户端从 tun_mtu 推）
+            tun_mtu: 0,
         }
     }
 }
@@ -124,6 +138,24 @@ pub fn create_tcp_listener(addr: SocketAddr, opts: ListenOptions) -> io::Result<
     }
     if opts.send_buffer > 0 {
         let _ = socket.set_send_buffer_size(opts.send_buffer);
+    }
+
+    // MSS 钳制必须在 bind/listen 之前：内核在建链时快照一次 TCP_MAXSEG，
+    // accept 出的子 socket 才继承得到。设晚了只影响之后的新连接，而 MTU 黑洞
+    // 杀的正是首包之后的大包 —— 等于没设。
+    //
+    // 双栈监听（`[::]:port` 同时吃 v4 与 v6）取 **v6 口径**（MTU−60）：
+    // 同一个 socket 无法对两个族分别设定，宁可让 v4 也用小 MSS。
+    if opts.tun_mtu != 0 {
+        let mss = mss::mss_for_mtu(opts.tun_mtu, matches!(addr, SocketAddr::V6(_)));
+        match mss::apply_mss_to_listener(socket.as_raw_fd(), mss) {
+            Ok(()) => debug!("TCP_MAXSEG={} (mtu {}) on {addr}", mss, opts.tun_mtu),
+            Err(e) => {
+                // 不是致命错误：黑洞仍可由 tcp_mtu_probing 兜底，但必须留下痕迹。
+                // 这台内核没有 xt_TCPMSS，iptables 那条路是不通的。
+                debug!("TCP_MAXSEG unavailable on {addr}: {e}");
+            }
+        }
     }
 
     socket.set_nonblocking(true)?;

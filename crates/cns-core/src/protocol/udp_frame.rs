@@ -314,18 +314,8 @@ mod tests {
 /// Linux 在这种 socket 上 `recv_from` 会把 IPv4 对端报告成 `::ffff:127.0.0.1`，
 /// 若原样写回 httpUDP 帧就变成 addr_type=3（IPv6），而客户端明明发的是 IPv4 目标。
 /// 在只路由 IPv4 的免流隧道里，这会让回包被判成非法地址族而丢弃。
-pub fn canonicalize_addr(addr: SocketAddr) -> SocketAddr {
-    if let SocketAddr::V6(v6) = addr {
-        let o = v6.ip().octets();
-        if o[..10] == [0u8; 10] && o[10..12] == [0xff, 0xff] {
-            return SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15])),
-                v6.port(),
-            );
-        }
-    }
-    addr
-}
+pub use crate::net_addr::{canonicalize_addr, canonicalize_ip};
+
 
 #[cfg(test)]
 mod canonicalize_tests {

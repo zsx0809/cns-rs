@@ -2,9 +2,10 @@
 # ============================================================================
 # cns-rs 产物构建
 #
-#   bin/cns-server-x86_64   x86_64-unknown-linux-musl   真静态  -> VPS 服务端
-#   bin/cns-server-aarch64  aarch64-unknown-linux-musl  真静态  -> ARM 服务器/OpenWrt
-#   bin/cns-client-aarch64  aarch64-linux-android       bionic  -> 手机（模块内）
+#   cns-server-x86_64   x86_64-unknown-linux-musl   真静态  -> VPS 服务端
+#   cns-server-aarch64  aarch64-unknown-linux-musl  真静态  -> ARM 服务器/OpenWrt
+#   cns-client-aarch64  aarch64-linux-android       bionic  -> 手机（模块内）
+#   （三个产物只写在仓库根目录一份，与 README / install.sh / Releases 的指向一致）
 #
 # 为什么服务端用 musl、客户端用 Android：
 #   服务端要在各种发行版/内核上「拷过去就能跑」，glibc 版本墙会直接导致
@@ -13,7 +14,7 @@
 #   用 bionic 目标产物最小且不需要任何额外 .so。
 #
 # 用法:
-#   bash scripts/build.sh                  # 构建全部并写入 bin/
+#   bash scripts/build.sh                  # 构建全部三个产物到仓库根目录
 #   bash scripts/build.sh --host           # 只构建当前架构（调试用）
 #   bash scripts/build.sh --server-only    # 只构建服务端
 #   bash scripts/build.sh --clean          # 构建后清理 target/ 释放空间
@@ -87,13 +88,12 @@ for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
      并保证 host 的 rustc 版本与 std 版本一致"
 done
 
-mkdir -p bin
-# 产物主目录是仓库根（README / install.sh / 下载链接都以根目录为准），
-# bin/ 仅作为向后兼容的镜像，两处内容始终一致。
+# 产物只落在仓库根目录一份。
+# 曾经这里还镜像到 bin/，但 README 与 install.sh 的下载链接都以根目录为准，
+# 同一二进制存两份就会出现「装了过期那份」的故障面；v0.2.1 起彻底取消镜像。
 publish() {
     local src="$1" name="$2"
     install -m 755 "$src" "$name"
-    install -m 755 "$src" "bin/$name" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- 构建函数

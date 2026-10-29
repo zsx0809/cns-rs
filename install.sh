@@ -195,14 +195,90 @@ show_banner() {
     echo -e "${PLAIN}"
 }
 
+# ============ 二进制来源清单与校验 ============
+# 三件套（cns-server-x86_64 / cns-server-aarch64 / cns-client-aarch64）与
+# sha256sums.txt 都在**仓库根目录**入库（见 .gitignore 的 !/cns-server-*）。
+# 旧版这里下的是 raw/main/bin/cns-server-<arch>：仓库里从来没有 bin/ 目录
+# （.gitignore 只跟踪根目录一份），那两个 URL 每次安装必然 404 一轮才落到
+# Releases，白等两次超时。现在按「raw 根目录 -> Releases -> raw 加速镜像」排序。
+binary_urls() {
+    # $1 = 文件名
+    local name="$1"
+    printf '%s\n' \
+        "${GITHUB_RAW}/${name}" \
+        "https://github.com/zsx0809/cns-rs/releases/latest/download/${name}" \
+        "${GITHUB_PROXY_RAW}/${name}"
+}
+
+fetch_one() {
+    # $1 = 文件名  $2 = 落地路径；命中即返回 0
+    local name="$1" out="$2" url
+    while IFS= read -r url; do
+        color_echo "$YELLOW" "尝试下载: $url"
+        if curl -fsSL --connect-timeout 10 --retry 2 "$url" -o "$out"; then
+            [ -s "$out" ] || continue
+            echo "    ✓ 来源: $url" >&2
+            return 0
+        fi
+    done < <(binary_urls "$name")
+    return 1
+}
+
+# 用 sha256sums.txt 校验下载到的二进制。
+# 清单取不到 = 拒绝安装：没有校验的远程二进制等于把「装什么」交给中间人。
+# （本地已存在的文件不走这里 —— 那是用户自己编译/准备的，校验无意义）
+verify_sha256() {
+    local name="$1" file="$2"
+    local man="/tmp/cns-sha256sums.$$.txt"
+    rm -f "$man"
+    # 静默取清单：二进制那一步已经打印过来源了，这里再刷三行「尝试下载」纯属噪音
+    if ! fetch_one "sha256sums.txt" "$man" >/dev/null 2>&1; then
+        color_echo "$RED" "❌ 无法获取 sha256sums.txt，拒绝安装未校验的二进制。"
+        color_echo "$YELLOW" "   离线安装方式：先把 cns-server-${TARGET_ARCH} 与本脚本放在同一目录再执行。"
+        rm -f "$man"
+        return 1
+    fi
+    local want got
+    want=$(awk -v n="$name" '$2 == n {print $1; exit}' "$man")
+    rm -f "$man"
+    if [ -z "$want" ]; then
+        color_echo "$RED" "❌ sha256sums.txt 里没有 $name 的条目（清单与产物不匹配），拒绝安装。"
+        return 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        got=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        got=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        color_echo "$RED" "❌ 本机没有 sha256sum/shasum，无法完成校验，拒绝安装。"
+        return 1
+    fi
+    if [ "$want" != "$got" ]; then
+        color_echo "$RED" "❌ SHA-256 不匹配，文件可能被篡改或下载不完整！"
+        echo "     期望: $want"
+        echo "     实际: $got"
+        return 1
+    fi
+    color_echo "$GREEN" "✓ SHA-256 校验通过 ($name)"
+    return 0
+}
+
 download_binary() {
     detect_arch
     mkdir -p /usr/local/bin
     color_echo "$YELLOW" "正在获取适合当前系统的静态二进制服务端 (架构: ${TARGET_ARCH})..."
 
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
-    LOCAL_BIN="${SCRIPT_DIR}/bin/cns-server-${TARGET_ARCH}"
     LOCAL_DIRECT="${SCRIPT_DIR}/cns-server-${TARGET_ARCH}"
+    # bin/ 是历史镜像目录，v0.2.x 起产物只在根目录存一份；留着只为兼容旧克隆
+    LOCAL_BIN="${SCRIPT_DIR}/bin/cns-server-${TARGET_ARCH}"
+
+    # 根目录优先：那是 README/install 指向的权威位置
+    if [ -f "$LOCAL_DIRECT" ]; then
+        color_echo "$GREEN" "✓ 发现本地已存在预编译二进制: $LOCAL_DIRECT"
+        install -m 755 "$LOCAL_DIRECT" "$BIN_PATH"
+        return 0
+    fi
 
     if [ -f "$LOCAL_BIN" ]; then
         color_echo "$GREEN" "✓ 发现本地已存在预编译二进制: $LOCAL_BIN"
@@ -210,32 +286,15 @@ download_binary() {
         return 0
     fi
 
-    if [ -f "$LOCAL_DIRECT" ]; then
-        color_echo "$GREEN" "✓ 发现本地已存在预编译二进制: $LOCAL_DIRECT"
-        install -m 755 "$LOCAL_DIRECT" "$BIN_PATH"
-        return 0
+    local BIN_NAME="cns-server-${TARGET_ARCH}"
+    TMP_BIN="/tmp/${BIN_NAME}.$$"
+    if ! fetch_one "$BIN_NAME" "$TMP_BIN"; then
+        color_echo "$RED" "❌ 无法自动下载预构建二进制，请检查网络连接。"
+        rm -f "$TMP_BIN"
+        exit 1
     fi
 
-    # 尝试多源下载预编译静态二进制
-    URLS=(
-        "${GITHUB_RAW}/bin/cns-server-${TARGET_ARCH}"
-        "${GITHUB_PROXY_RAW}/bin/cns-server-${TARGET_ARCH}"
-        "https://github.com/zsx0809/cns-rs/releases/latest/download/cns-server-${TARGET_ARCH}"
-    )
-
-    TMP_BIN="/tmp/cns-server-${TARGET_ARCH}.$$"
-    DOWNLOADED=false
-    for URL in "${URLS[@]}"; do
-        color_echo "$YELLOW" "尝试下载: $URL"
-        if curl -fsSL --connect-timeout 10 --retry 2 "$URL" -o "$TMP_BIN"; then
-            DOWNLOADED=true
-            color_echo "$GREEN" "✓ 静态二进制下载完成！"
-            break
-        fi
-    done
-
-    if [ "$DOWNLOADED" != "true" ]; then
-        color_echo "$RED" "❌ 无法自动下载预构建二进制，请检查网络连接。"
+    if ! verify_sha256 "$BIN_NAME" "$TMP_BIN"; then
         rm -f "$TMP_BIN"
         exit 1
     fi
@@ -300,8 +359,16 @@ install_cns_server() {
 
     # 1. 引导用户输入核心免流参数
     echo ""
-    read -p "请输入服务端监听端口 [默认 1254]: " INPUT_PORT
-    LISTEN_PORT="${INPUT_PORT:-1254}"
+    # 端口必须校验：空/非数字/越界若放过去，会写出一个 bind 必败的 config.json，
+    # 而 svc_restart 不检查返回值 —— 结果是「服务在跑、端口没监听」这种最难查的静默失败。
+    while true; do
+        read -p "请输入服务端监听端口 [默认 1254]: " INPUT_PORT
+        LISTEN_PORT="${INPUT_PORT:-1254}"
+        if [[ "$LISTEN_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$LISTEN_PORT" -le 65535 ]; then
+            break
+        fi
+        color_echo "$RED" "✗ 端口非法: '$LISTEN_PORT'（必须是 1-65535 的纯数字，不允许前导零）"
+    done
 
     DEFAULT_PWD=$(head /dev/urandom 2>/dev/null | tr -dc A-Za-z0-9 | head -c 8 || echo "666888")
     read -p "请输入免流连接密码 [默认随机: $DEFAULT_PWD]: " INPUT_PWD
@@ -337,6 +404,13 @@ EOF
     # 5. 配置服务并启动
     setup_service
     svc_restart
+    # 关键：安装流程必须验证「真的监听上了」。旧实现只看 svc_restart 是否报错，
+    # 而 unit 里 ExecStart 失败会被 systemd 吞掉，用户看到「安装成功」却是空壳服务。
+    sleep 1
+    if ! verify_running; then
+        color_echo "$RED" "❌ 服务端安装完成但未能正常监听，已保留配置供排查：$CONF_FILE"
+        return 1
+    fi
 
     # 6. 获取服务器真实可访问的公网 IP / 节点地址
     # 策略：优先判断物理网卡是否存在真正的公网 IPv4（排除 RFC1918 私网如 192.168/10/172 等）
@@ -423,6 +497,143 @@ view_logs() {
     fi
 }
 
+# ---------- 配置/运行状态自检 ----------
+# listen_addr 的提取不能用 "grep -o '"listen_addr"[^]]*]'"：
+# 数组元素本身含方括号（"[::]:1254"），[^]] 会在第一个内层 ']' 处截断，
+# 于是只读到半条 spec，端口校验与监听检查双双落空。
+# 这里用「引号状态 + 括号配对」的字符级扫描，兼容单行与多行数组。
+listen_specs() {
+    awk '
+        { buf = buf $0 " " }
+        END {
+            key = "\"listen_addr\""
+            i = index(buf, key)
+            if (i == 0) exit 1
+            rest = substr(buf, i + length(key))
+            # 跳到数组左括号
+            b = 0
+            for (j = 1; j <= length(rest); j++) {
+                c = substr(rest, j, 1)
+                if (c == "[") { b = j; break }
+            }
+            if (b == 0) exit 1
+            body = substr(rest, b + 1)
+
+            depth = 1;inq = 0;cur = "";out = ""
+            for (j = 1; j <= length(body); j++) {
+                c = substr(body, j, 1)
+                if (inq) {
+                    if (c == "\"") { inq = 0; if (cur != "") out = out cur "\n"; cur = "" }
+                    else cur = cur c
+                    continue
+                }
+                if (c == "\"") { inq = 1; continue }
+                if (c == "[") { depth++; continue }
+                if (c == "]") { depth--; if (depth == 0) break; continue }
+            }
+            if (out == "") exit 1
+            printf "%s", out
+        }' "$CONF_FILE"
+}
+
+# 从 spec 取端口（最后一个引号外冒号后的数字；括号内 IPv6 不受影响）
+spec_port() {
+    case "$1" in
+        \[*\]*) printf '%s' "${1##*\]}" | sed 's/^://' ;;
+        *)      printf '%s' "${1##*:}" ;;
+    esac
+}
+
+# listen_addr 语法检查：IPv6 必须带方括号；裸 IPv6 会导致 bind 必败
+check_listen_addr_syntax() {
+    local spec port bad=0
+    local specs
+    specs=$(listen_specs) || { color_echo "$RED" "✗ $CONF_FILE 里没有可解析的 listen_addr 数组"; return 1; }
+    if [ -z "$specs" ]; then
+        color_echo "$RED" "✗ listen_addr 为空数组"; return 1
+    fi
+    while IFS= read -r spec; do
+        [ -z "$spec" ] && continue
+        port=$(spec_port "$spec")
+        case "$port" in
+            ''|*[!0-9]*)
+                color_echo "$RED" "✗ listen_addr '$spec' 缺少合法端口"; bad=1; continue ;;
+        esac
+        if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            color_echo "$RED" "✗ listen_addr '$spec' 端口越界（$port）"; bad=1
+        fi
+        case "$spec" in
+            \[*\]*:*) : ;;                                  # [::]:1254 / [2a0c::1]:1254
+            \[*|*\]*) color_echo "$RED" "✗ listen_addr '$spec' 方括号不成对"; bad=1 ;;
+            *:*:*)
+                color_echo "$RED" "✗ listen_addr '$spec' 里的 IPv6 必须加方括号（应写成 [${spec%:*}]:${port}）"
+                bad=1 ;;
+            *.*)  : ;;                                      # 0.0.0.0:1254 / 1.2.3.4:1254
+            :*)   : ;;                                      # :1254 双栈通配
+            *)    color_echo "$RED" "✗ listen_addr '$spec' 无法解析"; bad=1 ;;
+        esac
+    done <<EOF
+$specs
+EOF
+    return $bad
+}
+
+# 服务进程是否活着（systemd / openrc / sysv / 裸进程 四层兜底）
+svc_status_running() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet cns-server 2>/dev/null && return 0 ;;
+        openrc)  rc-service cns-server status >/dev/null 2>&1 && return 0 ;;
+    esac
+    if [ -f /run/cns-server.pid ]; then
+        kill -0 "$(cat /run/cns-server.pid)" 2>/dev/null && return 0
+    fi
+    pgrep -f 'cns-server' >/dev/null 2>&1
+}
+
+# 重启后必须确认「真的在监听」：进程活着 != 端口 bind 成功。
+# 旧实现只判断 svc_restart 是否报错，而 unit 里 ExecStart 失败会被 init 吞掉，
+# 用户看到「安装成功」，实际是个空壳服务（客户端永远连不上）。
+verify_running() {
+    local port found=0 ports="" checked=0
+    if ! svc_status_running; then
+        color_echo "$RED" "✗ 服务进程未运行，日志尾部："
+        tail -n 20 "$LOG_FILE" 2>/dev/null
+        return 1
+    fi
+    while IFS= read -r spec; do
+        [ -z "$spec" ] && continue
+        port=$(spec_port "$spec")
+        case "$port" in ''|*[!0-9]*) continue ;; esac
+        checked=$((checked + 1))
+        ports="$ports $port"
+        if command -v ss >/dev/null 2>&1; then
+            ss -lnt 2>/dev/null | grep -q ":$port " && found=1
+        elif command -v netstat >/dev/null 2>&1; then
+            netstat -lnt 2>/dev/null | grep -q ":$port " && found=1
+        else
+            # 退化路径：/proc/net/tcp*，状态 0A = LISTEN，本地地址尾段是端口的大写十六进制
+            if awk '$4 == "0A" {print $2}' /proc/net/tcp /proc/net/tcp6 2>/dev/null |
+                   grep -q ":$(printf '%04X' "$port")\$"; then
+                found=1
+            fi
+        fi
+    done <<EOF
+$(listen_specs 2>/dev/null)
+EOF
+    if [ "$found" = "1" ]; then
+        color_echo "$GREEN" "✓ 监听正常（端口:${ports:- 未识别}）"
+        return 0
+    fi
+    if [ "$checked" = "0" ]; then
+        color_echo "$YELLOW" "⚠️  未能从 $CONF_FILE 提取端口，跳过监听检查"
+        return 0
+    fi
+    color_echo "$RED" "✗ 进程在运行，但 listen_addr 的端口没有一个处于监听状态！"
+    color_echo "$YELLOW" "  常见原因：IPv6 未加方括号导致 bind 失败 / 端口被占用 / 本机无该族地址"
+    tail -n 20 "$LOG_FILE" 2>/dev/null
+    return 1
+}
+
 modify_config() {
     check_root
     detect_os
@@ -435,8 +646,19 @@ modify_config() {
     else
         vi "$CONF_FILE"
     fi
+    # 改完先验语法再重启：非法配置一旦重启成功但 bind 失败，服务就成了空壳
+    if ! check_listen_addr_syntax; then
+        color_echo "$RED" "✗ listen_addr 语法有误，已取消重启（避免把服务打成空壳）"
+        color_echo "$YELLOW" "  正确写法：\":1254\"（双栈）、\"0.0.0.0:1254\"、\"[::]:1254\"、\"[2001:db8::1]:13872\""
+        return 1
+    fi
     svc_restart
-    color_echo "$GREEN" "✓ 配置文件已更新并重启服务！"
+    if verify_running; then
+        color_echo "$GREEN" "✓ 配置文件已更新并重启服务！"
+    else
+        color_echo "$RED" "⚠️  服务已重启但未通过监听检查，请核对上面的日志"
+        return 1
+    fi
 }
 
 update_cns_server() {
@@ -457,25 +679,17 @@ update_cns_server() {
 
     echo -e "● 当前已安装版本: ${YELLOW}${CURRENT_VER}${PLAIN} (特征码: ${LOCAL_HASH:0:8})"
 
-    # 尝试多源获取最新远程静态二进制
-    URLS=(
-        "${GITHUB_RAW}/bin/cns-server-${TARGET_ARCH}"
-        "${GITHUB_PROXY_RAW}/bin/cns-server-${TARGET_ARCH}"
-        "https://github.com/zsx0809/cns-rs/releases/latest/download/cns-server-${TARGET_ARCH}"
-    )
-
+    # 尝试多源获取最新远程静态二进制（顺序与安装路径一致：根目录 -> Releases -> 加速镜像）
+    local UP_NAME="cns-server-${TARGET_ARCH}"
     TMP_BIN="/tmp/cns-server-update-${TARGET_ARCH}.$$"
-    DOWNLOADED=false
-    for URL in "${URLS[@]}"; do
-        color_echo "$YELLOW" "正在获取最新版本: $URL"
-        if curl -fsSL --connect-timeout 10 --retry 2 "$URL" -o "$TMP_BIN"; then
-            DOWNLOADED=true
-            break
-        fi
-    done
-
-    if [ "$DOWNLOADED" != "true" ] || [ ! -s "$TMP_BIN" ]; then
+    if ! fetch_one "$UP_NAME" "$TMP_BIN"; then
         color_echo "$RED" "❌ 获取最新服务端版本失败，请检查网络连接。"
+        rm -f "$TMP_BIN"
+        return 1
+    fi
+
+    # 更新路径同样必须校验：这是「把运行中的服务端二进制换掉」，被篡改的后果比首次安装更严重
+    if ! verify_sha256 "$UP_NAME" "$TMP_BIN"; then
         rm -f "$TMP_BIN"
         return 1
     fi

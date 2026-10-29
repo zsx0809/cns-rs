@@ -6,6 +6,6 @@ pub use handshake::{
     HandshakeResult, SessionType, MAX_HANDSHAKE_BYTES, MIN_HTTP_PROBE_LEN,
 };
 pub use udp_frame::{
-    canonicalize_addr, HttpUdpCodec, UdpPacket, HEADER_LEN_V4, HEADER_LEN_V6, MAX_FRAME_LEN,
-    MAX_PAYLOAD_LEN,
+    canonicalize_addr, canonicalize_ip, HttpUdpCodec, UdpPacket, HEADER_LEN_V4, HEADER_LEN_V6,
+    MAX_FRAME_LEN, MAX_PAYLOAD_LEN,
 };
