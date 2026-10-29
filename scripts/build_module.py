@@ -4,8 +4,9 @@
 相对旧版的改动：
 * 版本号从 `Cargo.toml` 的 `[workspace.package] version` 单一真源读取，
   不再在脚本里硬编码（旧版脚本写死 v0.1.0，发布包却是 v0.1.1，两边对不上）。
-* 二进制从仓库根的 `cns-client-aarch64` 注入到 zip 的 `Core/cns-client`，
-  模块源码目录里不再保存任何二进制副本。
+* 二进制从 `dist/cns-client-aarch64` 注入到 zip 的 `Core/cns-client`，
+  模块源码目录里不再保存任何二进制副本；zip 与 .sha256 也写进 `dist/`，
+  仓库根目录只留源码与脚本（`scripts/build_module.py` 自己也是 scripts/ 的一员）。
 * 权限按类型区分：脚本与二进制 0755，配置/文档 0644（旧版把 README 和 json 也设成
   0755，属权限过宽）。
 * 打包前做真实校验：必备文件存在、二进制架构正确、JSON 可解析、zip 内无 `..` 路径。
@@ -24,8 +25,13 @@ import subprocess
 import sys
 import zipfile
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# 本脚本住在 scripts/ 下，仓库根是它的上一级：
+# ROOT/Cargo.toml 是版本号真源，ROOT/android-module 是打包源，ROOT/dist 是产物目录。
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "android-module")
+# 发布产物目录（与 scripts/build.sh 的 DIST、install.sh 的 raw/main/dist 一致）
+DIST = os.path.join(ROOT, "dist")
 
 EXECUTABLE_MODE = 0o755
 DATA_MODE = 0o644
@@ -80,6 +86,50 @@ def load_json(path: str) -> object:
         sys.exit(f"✗ {os.path.relpath(path, ROOT)} 不是合法 JSON: {e}")
 
 
+def validate_module_prop(path: str) -> None:
+    """严格校验 module.prop 符合 Magisk / KernelSU / APatch 规范。"""
+    raw = open(path, "rb").read()
+    if b"\r" in raw:
+        sys.exit(f"✗ {path} 包含 Windows CRLF 换行，必须严格使用 LF (\\n)")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        sys.exit(f"✗ {path} 包含 UTF-8 BOM，必须使用无 BOM 的纯 UTF-8 编码")
+    if not raw.endswith(b"\n"):
+        sys.exit(f"✗ {path} 末尾缺少空换行符 (\\n)")
+
+    text = raw.decode("utf-8")
+    props = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            sys.exit(f"✗ {path} 非法属性行: {line}")
+        k, v = line.split("=", 1)
+        props[k.strip()] = v.strip()
+
+    required = ["id", "name", "version", "versionCode", "author", "description"]
+    for req in required:
+        if req not in props or not props[req]:
+            sys.exit(f"✗ {path} 缺少必填属性: {req}")
+
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9._-]+$", props["id"]):
+        sys.exit(f"✗ {path} 的 id 格式不合规: {props['id']}")
+
+    if not props["versionCode"].isdigit() or int(props["versionCode"]) <= 0:
+        sys.exit(f"✗ {path} 的 versionCode 必须是正整数: {props['versionCode']}")
+
+
+def validate_shell_scripts() -> None:
+    """静态语法检查所有 shell 脚本。"""
+    for root, _, files in os.walk(SRC):
+        for name in files:
+            if name.endswith(".sh"):
+                sh_path = os.path.join(root, name)
+                res = subprocess.run(["sh", "-n", sh_path], capture_output=True, text=True)
+                if res.returncode != 0:
+                    sys.exit(f"✗ Shell 语法检查失败: {sh_path}\n{res.stderr}")
+
+
 def write_module_prop(version: str) -> None:
     """module.prop 的 version/versionCode 由 Cargo.toml 决定。"""
     path = os.path.join(SRC, "module.prop")
@@ -92,8 +142,10 @@ def write_module_prop(version: str) -> None:
             out.append(f"versionCode={version_code(version)}")
         else:
             out.append(line)
-    open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
-    print(f"✓ module.prop -> v{version} ({version_code(version)})")
+    with open(path, "w", encoding="utf-8", newline="\n") as fp:
+        fp.write("\n".join(out) + "\n")
+    validate_module_prop(path)
+    print(f"✓ module.prop -> v{version} ({version_code(version)}) [规范校验通过]")
 
 
 def collect_entries(binary: str | None, keep_existing_binary: bool) -> list[tuple[str, str, int]]:
@@ -134,7 +186,7 @@ def collect_entries(binary: str | None, keep_existing_binary: bool) -> list[tupl
             if not keep_existing_binary and rel == "Core/cns-client":
                 sys.exit(
                     "✗ android-module/Core/cns-client 是仓库里的旧副本。\n"
-                    "  请先运行 bash scripts/build.sh 生成 ./cns-client-aarch64，"
+                    "  请先运行 bash scripts/build.sh 生成 dist/cns-client-aarch64，"
                     "或用 --binary 显式指定。"
                 )
             mode = EXECUTABLE_MODE if (rel in exec_names or rel.startswith("Core/") and rel.endswith(".sh")) else DATA_MODE
@@ -180,6 +232,7 @@ def build(version: str, binary: str | None, out_dir: str) -> str:
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for rel, full, mode in sorted(entries):
             info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))  # 固定时间戳 -> 可复现构建
+            info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = (stat.S_IFREG | mode) << 16
             info.create_system = 3  # unix
             with open(full, "rb") as fp:
@@ -209,17 +262,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="打包 cns-rs Android 模块")
     ap.add_argument(
         "--binary",
-        help="要注入的 aarch64 Android cns-client 路径（默认按 cns-client-aarch64 -> bin/ 顺序自动查找）",
+        help="要注入的 aarch64 Android cns-client 路径（默认自动查找 dist/cns-client-aarch64）",
     )
     ap.add_argument("--version", help="覆盖版本号（默认读 Cargo.toml）")
-    ap.add_argument("--out", default=ROOT, help="输出目录")
+    ap.add_argument("--out", default=DIST, help=f"输出目录（默认 {os.path.relpath(DIST, ROOT)}/）")
     args = ap.parse_args()
 
     version = args.version or workspace_version()
+    validate_shell_scripts()
     binary = args.binary
     if binary is None:
-        # 产物只有一处：仓库根的 cns-client-aarch64
-        for cand in (os.path.join(ROOT, "cns-client-aarch64"),):
+        # 产物只有一处：仓库的 dist/cns-client-aarch64
+        for cand in (os.path.join(DIST, "cns-client-aarch64"),):
             if os.path.isfile(cand):
                 binary = cand
                 break

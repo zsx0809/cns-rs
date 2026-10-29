@@ -1,0 +1,27 @@
+{
+  "socks5_listen": "127.0.0.1:1080",
+  "dns_listen": "127.0.0.1:6653",
+  "cns_server": "127.0.0.1:1254",
+  "cns_password": "your_password_here",
+  "proxy_key": "Meng",
+  "udp_flag": "httpUDP",
+  "header_host": "mclient.alipay.com",
+  "custom_header": null,
+  "enable_tfo": true,
+  "timeout_seconds": 60,
+
+  "tproxy_listen": "[::]:7750",
+  "tproxy_mode": "redirect",
+  "gid": 3004,
+
+  "dns_mode": "orig",
+  "dns_upstream": ["223.5.5.5:53", "8.8.8.8:53"],
+  "block_ipv6": true,
+  "dns_cache_size": 2048,
+
+  "enable_udp_tunnel": true,
+  "buffer_pool_cap": 64,
+  "session_max_age_seconds": 600,
+
+  "tun_mtu": 1350
+}

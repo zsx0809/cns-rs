@@ -77,14 +77,43 @@ pub async fn read_response_head<S>(
 where
     S: AsyncReadExt + Unpin,
 {
-    let (raw, complete) = read_until_header_end(stream, per_read_timeout, max_bytes).await?;
-    if !complete {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "connection closed before response header completed",
-        ));
+    // 响应方向必须单独一套循环：`read_until_header_end` 里的
+    // `is_undecided_http / is_http_request` 是**请求**启发式（HTTP_METHODS 表），
+    // 而响应以 `HTTP/1.1` 开头——既不是方法前缀、长度又 ≥ MIN_HTTP_PROBE_LEN，
+    // 于是一旦响应头被拆到两个 TCP 段里就会被判成「不是 HTTP」并直接报
+    // UnexpectedEof。握手成败因此与 TCP 首段切点强相关，是最难查的一类随机失败。
+    let mut raw = BytesMut::with_capacity(READ_CHUNK * 2);
+    let mut tmp = [0u8; READ_CHUNK];
+    loop {
+        if raw.len() >= max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake response exceeded limit without header terminator",
+            ));
+        }
+        let n = timeout(per_read_timeout, stream.read(&mut tmp))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake read timed out"))??;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before response header completed",
+            ));
+        }
+        raw.extend_from_slice(&tmp[..n]);
+        if find_header_end(&raw).is_some() {
+            break;
+        }
+        // 前缀已足以否定 HTTP：立刻失败，不留 60 秒超时的黑箱
+        if raw.len() >= 5 && !raw.starts_with(b"HTTP/") {
+            let snip = String::from_utf8_lossy(&raw[..raw.len().min(32)]).to_string();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("handshake response is not HTTP: {snip:?}"),
+            ));
+        }
     }
-    let idx = find_header_end(&raw).expect("complete implies terminator");
+    let idx = find_header_end(&raw).expect("loop exits only on terminator");
     let mut rest = raw;
     let head = rest.split_to(idx + 4).to_vec();
     Ok((head, rest))

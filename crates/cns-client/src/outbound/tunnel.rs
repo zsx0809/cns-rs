@@ -6,10 +6,12 @@
 use crate::config::ClientConfig;
 use cns_core::crypto::CuteBiCipher;
 use cns_core::transport::{
-    connect_any, pump_bidirectional_with_prefill, read_response_head, response_is_ok, BufferPool,
+    connect_any_mss, pump_bidirectional_with_prefill, read_response_head, response_is_ok,
+    BufferPool,
 };
 use std::io;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 pub struct CnsClientTunnel;
 
@@ -31,12 +33,22 @@ impl CnsClientTunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
-        let mut server_stream = connect_any(&config.cns_server, config.enable_tfo).await?;
+        // tun_mtu 非 0 时在 connect 之前钳 MSS —— MTU 黑洞（大文件传到固定字节数就卡死）
+        // 的用户态解法，与 README 承诺的字段对齐；默认 0 = 保持原行为。
+        let mut server_stream =
+            connect_any_mss(&config.cns_server, config.enable_tfo, config.tun_mtu).await?;
 
         // 混淆目标地址并组装 HTTP 伪装头
         let encrypted_target =
             if cipher.is_empty() { target_host.clone() } else { cipher.encrypt_host(&target_host) };
-        server_stream.write_all(&config.render_fake_header(&encrypted_target)).await?;
+        // 必须带超时：`enable_tfo=true`（默认）时 TCP_FASTOPEN_CONNECT 让 connect()
+        // 不产生 SYN，真正的建连发生在这一次 write 上。没有超时的话，一旦路由黑洞，
+        // 单个会话会卡到内核超时（实测可达 ~127 s），期间一直占着并发 permit。
+        timeout(config.timeout(), server_stream.write_all(&config.render_fake_header(&encrypted_target)))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "handshake write timed out")
+            })??;
 
         // 严格流式读取响应头
         let (head, sticky) = read_response_head(

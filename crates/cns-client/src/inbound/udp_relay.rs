@@ -92,7 +92,8 @@ impl UdpAssociates {
 /// 会话映射：隧道对端 -> 最初发起的 App 地址（回包靠它找路）
 #[derive(Clone)]
 struct SessionMap {
-    by_peer: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
+    /// 隧道对端 -> (最近一次发数据报的 App 地址, 该记录的最后活跃时刻)
+    by_peer: Arc<Mutex<HashMap<SocketAddr, (SocketAddr, Instant)>>>,
 }
 
 impl SessionMap {
@@ -102,17 +103,29 @@ impl SessionMap {
 
     fn bind(&self, peer: SocketAddr, app: SocketAddr) {
         if let Ok(mut m) = self.by_peer.lock() {
-            m.insert(canonicalize_addr(peer), app);
+            m.insert(canonicalize_addr(peer), (app, Instant::now()));
         }
     }
 
     fn lookup(&self, peer: SocketAddr) -> Option<SocketAddr> {
-        self.by_peer.lock().ok().and_then(|m| m.get(&canonicalize_addr(peer)).copied())
+        let mut m = self.by_peer.lock().ok()?;
+        let entry = m.get_mut(&canonicalize_addr(peer))?;
+        entry.1 = Instant::now(); // 活跃会话续期，别被 sweep 误杀
+        Some(entry.0)
     }
 
-    fn evict_older_than(&self, _age: Duration) -> usize {
-        // 本表以「隧道对端」为键，没有独立时间戳；随 relay 会话整体回收
-        0
+    /// 旧实现直接 `return 0`（注释写「随 relay 会话整体回收」），但 relay 是常驻的，
+    /// 于是这张表对每个出现过的对端只增不减 —— 长时间跑就是稳定的内存增长。
+    fn evict_older_than(&self, age: Duration) -> usize {
+        let cutoff = Instant::now() - age;
+        match self.by_peer.lock() {
+            Ok(mut m) => {
+                let before = m.len();
+                m.retain(|_, (_, t)| *t > cutoff);
+                before - m.len()
+            }
+            Err(_) => 0,
+        }
     }
 
     #[cfg(test)]

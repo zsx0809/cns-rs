@@ -1,0 +1,3 @@
+ae3a1d8553cddb8fbda10524d4f62b789ce5e44b6d8ca5fca8a78fb5b8f27e6e  cns-server-x86_64
+06de8e0a393c7f10ec52e7d9ca8f59489402da8e61b319839d020ca9aecf2c53  cns-server-aarch64
+768746afbfe1d6b1de896fea5917f85215db74fdf1c0df9e6808dfd681873c06  cns-client-aarch64

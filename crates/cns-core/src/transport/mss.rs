@@ -276,8 +276,13 @@ mod tests {
         drop(accepted);
     }
 
-    /// connect 之后再设会被内核按路由重夹 —— 这条反例把「顺序很重要」写进测试，
-    /// 免得以后有人把 apply_mss_before_connect 挪到 connect 后面还自觉没问题。
+    /// connect 之后再设 TCP_MAXSEG 是**无效操作**（Linux 只认 connect 之前的设置）——
+    /// 这条反例把「顺序很重要」写进测试，免得以后有人把 apply_mss_before_connect
+    /// 挪到 connect 后面还自觉没问题。
+    ///
+    /// 断言必须写成「不会把 MSS 抬起来」而不是「等于 1460」：内核在 connect 后会
+    /// 忽略这次 setsockopt 并回读原值，而 loopback 上的原值是 32767（本机 GKI 6.1
+    /// 实测），写死 `<= 1460` 会让这条测试在任何非 Android 内核上必红。
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn setting_mss_after_connect_does_not_raise_it_back() {
@@ -288,9 +293,13 @@ mod tests {
         let default = tcp_maxseg(client.as_raw_fd()).unwrap_or(0);
         set_tcp_maxseg(client.as_raw_fd(), 1460).unwrap();
         let now = tcp_maxseg(client.as_raw_fd()).unwrap_or(0);
-        assert!(now <= 1460, "钳制只会更小，实际 {now}");
-        assert!(now >= MIN_MSS, "{now} 必须仍在合法区间");
-        assert!(default > 0, "loopback 默认 MSS 应可读出（{default}）");
+        assert!(
+            now <= default.max(1460),
+            "connect 后的设置绝不可能抬高 MSS（default={default}, now={now}）"
+        );
+        if now > 0 {
+            assert!(now >= MIN_MSS, "{now} 可读时必须在合法区间");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -2,6 +2,109 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## 0.3.1
+
+> **字节不变，可与 v0.3.0 服务端直接混用。** 这一版修的是「日志里查不到的那三类
+> 故障」：进程活着但全站不通、偶发握手失败、一发 UDP 就烧 CPU；外加把文档承诺过
+> 但代码里不存在的客户端字段补齐。全部改动都有本机实测（`cargo check` / `cargo test`
+> 250 项全绿）与代码级证据，未触碰任何线上字节格式。
+
+### 修复
+
+- **TPROXY 模式一发 UDP 就把一个 worker 线程烧死**（`inbound/tproxy.rs`）。
+  收包循环用 `socket.readable()` + 裸 `recvmsg(MSG_DONTWAIT)`，绕过了 `try_io`；
+  tokio 只在 `try_io` 路径上清除 readiness 位，于是第一个包之后 `readable()` 恒为
+  Ready → `recvmsg` 返回 `EAGAIN` → `continue` 的纯自旋，该 worker 永不让出。
+  现场表现是「发热、掉电、其它会话变卡」，而默认 `redirect` 模式下这个 socket
+  根本没人给它导流，所以问题长期被掩盖。现改为 `try_io` + 单次唤醒最多抽 64 个包。
+- **偶发握手失败：响应头被用「请求方法表」判定**（`cns-core/transport/handshake_io.rs`）。
+  `read_until_header_end` 里的 HTTP 启发式只认 `CONNECT `/`GET ` 这些**请求**前缀，
+  而响应以 `HTTP/1.1` 开头；一旦 `HTTP/1.1 200 OK` 的首段恰好在 `"HTTP/1."`(7B)
+  或 `"HTTP/1.1"`(8B) 处被切开，两个判定都为 false → 直接
+  `UnexpectedEof: connection closed before response header completed`。
+  握手成败因此与 TCP 分段强相关，是最难复现的一类随机失败。现在响应方向走独立
+  循环（只找 `\r\n\r\n`），并在前缀已足以否定 HTTP 时立刻给出可读错误。
+- **监听 bind 失败只 `warn!`，进程带病常驻**（`main.rs`）。IPv4 透明代理或本地 DNS
+  中继绑定失败时，iptables 规则仍然把流量导到那个没人监听的端口 ——
+  用户看到的是「进程活着、日志干净、全站断网」。现在 IPv4 TCP 透明代理与 DNS
+  中继绑定失败一律终止启动并给出排查指引；IPv6 不可用仍按可容忍降级处理，
+  但若最终一个 TCP 监听都没起来也会拒绝启动。
+- **`SIGTERM` 未处理，优雅退出是死代码**（`main.rs`）。模块脚本用的是 `kill`
+  （SIGTERM）而非 `^C`，旧代码只 `ctrl_c()`，于是 `drain` 与「删除 pid 文件」
+  从不执行，每次关闭都是等 2 秒后被 `kill -9`，pid 文件还会残留。现已处理
+  SIGTERM / SIGHUP。
+- **一个慢查询会拆掉承载几十个并发查询的共享隧道**（`outbound/mux.rs`）。
+  `dns_query` 的任何 `Err` 都触发 `close()`，把同一条 mux 隧道上所有在途查询一起
+  判死并级联重建。现在只有非超时类错误才拆隧道，超时只让该查询失败。
+- **`select!` 的 `biased;` 让读分支饿死**（`outbound/mux.rs`）。请求队列持续非空时
+  「先收请求、后读应答」的固定顺序会让入向应答无限期推迟，表现为「查得到但不回」。
+- **出站首写没有超时，单会话可卡 ~127 秒**（`outbound/tunnel.rs`、`mux.rs`）。
+  `enable_tfo=true`（默认）时 `TCP_FASTOPEN_CONNECT` 让 `connect()` 不产生 SYN，
+  真正的建连发生在首次 `write` 上；这次写没有超时，遇到路由黑洞就要等内核超时，
+  期间一直占着并发 permit。现在首写按 `timeout_seconds` 限时。
+- **透明回包 socket 缺 `SO_REUSEADDR`，每条 DNS 应答白白降级**
+  （`inbound/dns.rs`、`inbound/tproxy.rs`）。REDIRECT 模式下 `orig_dst` 常常就是
+  中继自己的监听地址，bind 必然 `EADDRINUSE`，于是每条应答都要多建一两个 socket
+  再走 raw / relay 兜底。现在先开 `SO_REUSEADDR`。
+- **UDP relay 会话表只增不减**（`inbound/udp_relay.rs`）。`SessionMap::evict_older_than`
+  直接 `return 0`（注释写「随 relay 会话整体回收」，但 relay 是常驻的），
+  长时间运行是稳定的内存增长。现在记录最后活跃时刻并在 sweep 里真正回收。
+- **`block_ipv6` 的 IPv6 告警从来没打出来过**（`inbound/dns.rs`）。
+  `local_interface_addresses()` 对 `/proc/net/if_inet6` 用了 `read_dir`，
+  而那是个**文件**不是目录，永远返回空 → 「本机有全局 IPv6 却拦掉 AAAA」的提醒
+  形同不存在。现已按文件解析。
+- **`DNS 没有可用上游` 只在 `debug!` 里**（`inbound/dns.rs`）。这是
+  「`dns_mode=orig` 在 REDIRECT 下失效」的唯一症状，默认 `warn` 级别看不见。
+  现已用 `warn_once` 打出来（附配置修复指引），并在启动期对
+  `tproxy_mode=redirect` + `dns_mode=orig` 这个必然失效的组合直接告警。
+- **`transport::mss` 的一条测试在非 Android 内核上必红**。它断言
+  `connect` 之后设 `TCP_MAXSEG` 会读回 `≤1460`，而 Linux 只在连接建立**前**认这个
+  选项：connect 后设置被静默忽略，loopback 上读数就是 32767。断言改为「绝不会把
+  MSS 抬高」，并保留「顺序很重要」这一原始意图，避免 CI 长期红着掩盖真回归。
+
+### 新增
+
+- **客户端 `tun_mtu`**（`configs/client.json` 已带注释、默认样例值 `1350`）。
+  非 0 时按 `mss_for_mtu` 推导 MSS，并在**connect 之前**下发 `TCP_MAXSEG`
+  （`connect_tfo_mss` / `connect_any_mss`）。这是 v0.3.0 只做在服务端那条腿上的
+  MTU 黑洞治理，《CHANGELOG》与 `mss.rs` 注释里一直引用却并不存在的客户端字段。
+  **`tun_mtu: 0` = 不钳制（保持历史行为）**，取值范围 1280..=1500。
+- **用户可见的 `version` 与 `--version` 现在一致**：脚本打包时从
+  `Cargo.toml` 的 `[workspace.package] version` 单一真源读取。
+
+### 变更（开发者可见）
+
+- **模块脚本不再容忍"双真源"配置**（`android-module/Core/cns_rules.sh`）。此前
+  `config.ini` 的 `tproxy_mode` 与 `modes/<模式>.json` 的 `tproxy_mode` 各写一份，
+  脚本用前者生成 iptables、客户端读后者解析原始目的地址：**只改一处就会让规则与
+  客户端对不上（TPROXY 规则 + REDIRECT 解析，或反过来），表现是全站断网且没有任何
+  报错**。现在新增 `preflight_check()`，在动任何规则之前比对两边，冲突即中止启动并
+  指明「改哪个文件、哪个字段」。这是本版唯一的行为收紧：**以前单边覆盖 `tproxy_mode`
+  会静默生效，现在会拒绝启动**（JSON 写 `auto` 仍按兼容处理，只提示）。
+- **QUIC 拦截与 `block_ipv6` 联动**（`cns_rules.sh`）。`blockQuic=1` 过去一律用
+  `REJECT --reject-with icmp-port-unreachable` 硬拒 UDP/443；当模式 JSON 里
+  `block_ipv6=true`（AAAA 已被本地 NODATA 拦掉）时，双栈 App 会同时失去 IPv6 和
+  QUIC 两条路并直接报网络错误，而不是平滑回退 TCP TLS。现在该组合改用 `-j DROP`
+  （软失败），其余情况保持 REJECT；`stop` 路径能把 DROP/REJECT 两种形态都清干净。
+  同处还修掉三个真实缺陷：`ip6tables` 无 nat 表导致 v6 的 QUIC 规则一直是死代码、
+  `stop` 清不掉上一形态残留、`status` 的模式显示可能为空。
+- **`scripts/build.sh` 现在能在一台干净的机器上跑通**。musl 目标此前依赖仓库外的
+  `.cargo/config.toml` 提供链接器（而 `.cargo/` 在 `.gitignore` 里），于是全新 clone
+  执行 `bash scripts/build.sh` 必然失败，报的还是 `cc: error: unrecognized
+  command-line option '-m64'` 这种与真实原因无关的信息。现在脚本自己把
+  `CARGO_TARGET_<TRIPLE>_LINKER` 指向 `scripts/zig-musl-cc.py`。
+- **配置面硬化**：`ClientConfig` 加 `deny_unknown_fields` —— 此前按文档写
+  `fakeip*` / `v6_faithful_ports` 等并不存在的字段会被静默忽略，用户以为生效了。
+  现在启动即报错。同时拒绝空 `udp_flag`（空串会让服务端把**每个** TCP 会话判成
+  httpUDP）、空 `proxy_key`、头部值里的 CR/LF/NUL，以及越界的
+  `buffer_pool_cap` / `dns_cache_size` / `session_max_age_seconds` / `tun_mtu`。
+- **仓库布局**：产物统一进 `dist/`（三个二进制 + 模块 zip + `sha256sums.txt`），
+  配置样例进 `configs/`（`client.json`、`server.json`），打包脚本进 `scripts/`。
+  根目录只留源码、`install.sh`（对外 `curl .../main/install.sh` 的入口）与构建元文件。
+  `install.sh` 的下载源同步改为 `raw/main/dist/…`，并保留根目录兜底以覆盖推送窗口期。
+- 修掉 `cns-server` 里读 `../../config.json` 的测试：目录整理后它会静默跳过，
+  现在指向 `configs/server.json` 且读不到就显式失败。
+
 ## 0.3.0
 
 > 从「能连上」到「能用」：根治 MTU 黑洞与 IPv6 无法劫持这两个把体验打死的问题。

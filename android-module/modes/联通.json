@@ -23,5 +23,7 @@
   "block_ipv6": true,
   "dns_cache_size": 2048,
   "buffer_pool_cap": 64,
-  "session_max_age_seconds": 600
+  "session_max_age_seconds": 600,
+
+  "tun_mtu": 1350
 }

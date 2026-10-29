@@ -8,6 +8,7 @@ use std::time::Duration;
 ///
 /// 兼容旧版字段名；新增项全部有默认值，旧 `client.json` 不改也能跑。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     /// SOCKS5 监听地址，空串 = 不启用
     #[serde(default = "default_socks5_listen")]
@@ -93,6 +94,14 @@ pub struct ClientConfig {
     /// 共享缓冲池容量（每方向 32KB）。默认 64 个 ≈ 2MB，适配手机内存。
     #[serde(default = "default_pool_cap")]
     pub buffer_pool_cap: usize,
+
+    /// 出站隧道的 MTU 口径：非 0 时按它推导 TCP_MAXSEG 并**在 connect 之前**下发，
+    /// 用来绕开「链路 MTU 小于隧道 MTU」造成的黑洞（大文件传到某个字节数就卡死）。
+    /// 0 = 不钳制（默认，保持历史行为）。
+    ///
+    /// 取值建议：1350（对应 MSS 1310，覆盖 4G/5G 常见的 1400~1460 链路 MTU）。
+    #[serde(default)]
+    pub tun_mtu: u16,
 }
 
 fn default_socks5_listen() -> String {
@@ -166,6 +175,7 @@ impl Default for ClientConfig {
             tproxy_mode: default_tproxy_mode(),
             socks5_udp_listen: String::new(),
             buffer_pool_cap: default_pool_cap(),
+            tun_mtu: 0,
         }
     }
 }
@@ -191,6 +201,29 @@ impl ClientConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.cns_server.trim().is_empty() {
             anyhow::bail!("cns_server must not be empty");
+        }
+        // 空 udp_flag 会让服务端 `header_str.contains("")` 恒真 —— 每个 TCP 会话都被
+        // 判成 httpUDP，等于全站断网。这类「配错一个字就静默瘫痪」的字段必须在启动期拒绝。
+        if self.udp_flag.is_empty() {
+            anyhow::bail!("udp_flag must not be empty");
+        }
+        if self.proxy_key.trim().is_empty() {
+            anyhow::bail!("proxy_key must not be empty");
+        }
+        // 伪装头是逐字节拼出来的，值里混进 CR/LF 会直接产出畸形请求
+        for (name, value) in [
+            ("header_host", self.header_host.as_str()),
+            ("proxy_key", self.proxy_key.as_str()),
+            ("udp_flag", self.udp_flag.as_str()),
+        ] {
+            if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+                anyhow::bail!("{name} must not contain CR/LF/NUL");
+            }
+        }
+        if let Some(extra) = self.custom_header.as_deref() {
+            if extra.contains("\r\n\r\n") || extra.contains('\0') {
+                anyhow::bail!("custom_header must not contain an empty line or NUL");
+            }
         }
         // 让明显写错的地址在启动时就报错，而不是等第一个请求
         if !self.socks5_listen.is_empty() {
@@ -224,6 +257,33 @@ impl ClientConfig {
         }
         if self.buffer_pool_cap == 0 {
             anyhow::bail!("buffer_pool_cap must be > 0");
+        }
+        // 每项 32 KB：写错一个零就是几百 MB 常驻，手机直接被系统杀掉
+        if self.buffer_pool_cap > 4096 {
+            anyhow::bail!(
+                "buffer_pool_cap={} 过大（每项 32KB，4096 项已约 128MB），请用 64~512",
+                self.buffer_pool_cap
+            );
+        }
+        if self.dns_cache_size > 65536 {
+            anyhow::bail!(
+                "dns_cache_size={} 过大（每条最多 4KB 应答），请用 512~8192",
+                self.dns_cache_size
+            );
+        }
+        if self.session_max_age_seconds > 86_400 {
+            anyhow::bail!(
+                "session_max_age_seconds={} 过大（0=不限，或 ≤86400）",
+                self.session_max_age_seconds
+            );
+        }
+        // 0 = 不钳制；非 0 必须落在 IPv6 最低 MTU（1280）到以太网 MTU（1500）之间，
+        // 否则钳出来的 MSS 反而制造新的黑洞。
+        if self.tun_mtu != 0 && !(1280..=1500).contains(&self.tun_mtu) {
+            anyhow::bail!(
+                "tun_mtu={} 非法：0=不钳制，或 1280..=1500（4G/5G 建议 1350）",
+                self.tun_mtu
+            );
         }
 
         // 隧道协议约束：CNS 的 tcpDNS 快速路径由服务端按「目标以 :53 结尾」识别

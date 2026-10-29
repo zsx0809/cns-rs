@@ -13,7 +13,7 @@ use crate::config::ClientConfig;
 use bytes::{Buf, Bytes, BytesMut};
 use cns_core::crypto::CuteBiCipher;
 use cns_core::protocol::{canonicalize_addr, HttpUdpCodec, UdpPacket};
-use cns_core::transport::{connect_any, read_response_head, response_is_ok};
+use cns_core::transport::{connect_any_mss, read_response_head, response_is_ok};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
@@ -193,10 +193,13 @@ impl MuxTunnel {
             MuxKind::Udp => config.render_udp_header(),
         };
 
-        let mut stream = connect_any(&config.cns_server, config.enable_tfo)
+        let mut stream = connect_any_mss(&config.cns_server, config.enable_tfo, config.tun_mtu)
             .await
             .map_err(|e| io::Error::new(e.kind(), format!("dial {} : {e}", config.cns_server)))?;
-        stream.write_all(&header).await?;
+        // 同 tunnel.rs：TFO_CONNECT 下建连推迟到首写，首写必须有超时。
+        timeout(config.timeout(), stream.write_all(&header))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake write timed out"))??;
 
         let (head, sticky) =
             read_response_head(&mut stream, config.timeout(), config.max_handshake_response())
@@ -365,8 +368,8 @@ fn spawn_driver(
 
             // 3. 读写并行推进
             tokio::select! {
-                biased;
-
+                // 不要 `biased;`：请求队列持续非空时，固定顺序会让读分支永远排不上，
+                // 入向应答被无限期推迟（DNS 表现为「查得到但不回」）。
                 maybe = req_rx.recv() => {
                     let Some(frame) = maybe else {
                         debug!("[{label}] all senders dropped, ending tunnel");
@@ -562,10 +565,18 @@ impl DnsChannel {
                     Ok(ans) => return Ok(ans),
                     Err(e) => {
                         debug!("dns query attempt {attempt} failed on {}: {e}", t.label());
+                        // 只有「隧道真的坏了」才拆它。单个查询超时不能杀掉承载着
+                        // 另外几十个并发查询的共享隧道——否则一次慢查询会级联重建，
+                        // 把整条 DNS 瀑布拖垮（默认 60 s 下这是最常见的抖动源）。
+                        let fatal = !matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        );
                         last_err = e;
-                        // 丢弃死隧道，下一次循环重建
-                        t.close();
-                        self.drop_current(&t);
+                        if fatal {
+                            t.close();
+                            self.drop_current(&t);
+                        }
                     }
                 },
                 Err(e) => {

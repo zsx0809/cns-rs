@@ -6,15 +6,23 @@
 #   4. curl --socks5-hostname 走完整隧道
 #   5. 断言拿到目标返回内容
 # 用法: bash crates/cns-server/tests/smoke_real_binary.sh [server_bin] [client_bin]
+#       （在仓库根执行；默认取 dist/cns-server-<arch> 与 dist/cns-client-<arch>）
 set -uo pipefail
 
-SERVER_BIN="${1:-cns-server-$(uname -m)}"
-CLIENT_BIN="${2:-cns-client-$(uname -m)}"
 # 裸文件名（如 cns-server-aarch64）会被当成 PATH 查找而报 command not found，
-# 这里统一补成 ./ 相对路径，保证按 README 抄的命令能直接跑。
-# 含任意 "/" 即为路径（绝对或相对），否则按仓库根相对路径补 "./"
-case "$SERVER_BIN" in */*) : ;; *) SERVER_BIN="./$SERVER_BIN" ;; esac
-case "$CLIENT_BIN" in */*) : ;; *) CLIENT_BIN="./$CLIENT_BIN" ;; esac
+# 这里统一解析成相对路径，保证按 README 抄的命令能直接跑。
+# 产物只存放在仓库的 dist/ 下（scripts/build.sh 的输出目录），所以裸名先看 dist/，
+# 再看当前目录 —— 旧文档里的 `... smoke_real_binary.sh cns-server-aarch64 ...` 依然可用。
+# 含任意 "/" 即视为路径（绝对或相对），原样使用。
+resolve_bin() {
+    case "$1" in
+        */*) printf '%s\n' "$1" ;;
+        *)   if [ -f "dist/$1" ]; then printf 'dist/%s\n' "$1"
+             else printf './%s\n' "$1"; fi ;;
+    esac
+}
+SERVER_BIN="$(resolve_bin "${1:-cns-server-$(uname -m)}")"
+CLIENT_BIN="$(resolve_bin "${2:-cns-client-$(uname -m)}")"
 PASS="cns-smoke-$(date +%s)"
 TMP="$(mktemp -d)"
 PIDS=()

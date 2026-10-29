@@ -2,17 +2,19 @@ use clap::Parser;
 use cns_client::config::ClientConfig;
 use cns_client::inbound::{
     apply_process_gid, get_original_dst_with_mode, register_associate, LocalDnsRelay,
-    Socks5Command, Socks5Handshake, TproxyMode, UdpAssociates, UdpRelay,
+    Socks5Command, Socks5Handshake, TproxyMode, UdpAssociates, UdpRelay, UdpTproxyRelay,
 };
 use cns_client::outbound::CnsClientTunnel;
 use cns_core::crypto::CuteBiCipher;
-use cns_core::transport::{create_tcp_listener, tune_tcp_stream, BufferPool, ListenOptions};
+use cns_core::transport::{
+    create_tcp_listener, create_udp_tproxy_socket, tune_tcp_stream, BufferPool, ListenOptions,
+};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -118,6 +120,17 @@ async fn main() -> anyhow::Result<()> {
     if config.cns_password.is_empty() {
         warn!("cns_password is EMPTY — traffic is unobfuscated. Set a password.");
     }
+    // REDIRECT 会把目的地址改写成中继自己的地址，本地 DNS 中继因此拿不到 App 原本
+    // 要查的 DNS；`dns_mode=orig` 在这种模式下必然失效并静默回落到 dns_upstream。
+    // 内网域名 / split-horizon 的正确解法是各模式 JSON 里显式写 dns_mode="fixed"。
+    if mode == TproxyMode::Redirect && config.dns_mode == "orig" {
+        warn!(
+            "tproxy_mode=redirect 与 dns_mode=orig 组合下拿不到 App 原本的 DNS 上游：\
+             所有查询会回落到 dns_upstream={:?}。内网/local 域名如需按原样解析，\
+             请在该模式 JSON 里改 dns_mode=\"fixed\" 并显式列出上游。",
+            config.dns_upstream
+        );
+    }
     if config.block_ipv6 {
         warn!(
             "block_ipv6=true：AAAA 将被本地 NODATA 拦截（IPv6-only 网络请设为 false）。\
@@ -193,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mut tproxy_listeners: Vec<(TcpListener, u16)> = Vec::new();
+    let mut udp_tproxy_sockets: Vec<(UdpSocket, u16)> = Vec::new();
     if let Some(port) = tproxy_port {
         for addr in [
             format!("0.0.0.0:{port}").parse::<SocketAddr>().unwrap(),
@@ -200,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
         ] {
             let opts = ListenOptions {
                 enable_tfo: config.enable_tfo,
-                ipv6_only: false,
+                ipv6_only: addr.is_ipv6(),
                 transparent: true,
                 ..Default::default()
             };
@@ -208,18 +222,51 @@ async fn main() -> anyhow::Result<()> {
                 Ok(l) => {
                     let bound = l.local_addr().unwrap_or(addr);
                     tproxy_listeners.push((l, port));
-                    info!("transparent proxy listening on {bound} ({})", addr);
+                    info!("TCP transparent proxy listening on {bound} ({})", addr);
                 }
                 Err(e) => {
-                    // IPv6 常被禁用，属可容忍降级；IPv4 失败则必须警告
+                    // IPv4 是出厂配置的主路径：端口被占 / 权限不足 / 上一个实例没退干净时，
+                    // iptables 仍然会把流量导到这个没人监听的端口 —— 用户看到的是
+                    // 「进程活着但全站断网」。这种情况必须终止启动，不能带病常驻。
                     if addr.is_ipv4() {
-                        warn!("failed to bind IPv4 transparent proxy on {addr}: {e}");
+                        anyhow::bail!(
+                            "failed to bind IPv4 TCP transparent proxy on {addr}: {e}\n\
+                             规则仍会把流量导到这里，拒绝带病启动。请检查端口占用\
+                             （ss -lntp | grep {port}）或上一个实例是否残留。"
+                        );
                     } else {
-                        debug!("IPv6 transparent proxy unavailable on {addr}: {e}");
+                        // IPv6 常被禁用，属可容忍降级
+                        debug!("IPv6 TCP transparent proxy unavailable on {addr}: {e}");
+                    }
+                }
+            }
+
+            // 若开启了 UDP 隧道，同时启动对应地址的 UDP 透明代理监听
+            if config.enable_udp_tunnel {
+                match create_udp_tproxy_socket(addr) {
+                    Ok(sock) => {
+                        let bound = sock.local_addr().unwrap_or(addr);
+                        udp_tproxy_sockets.push((sock, port));
+                        info!("UDP transparent proxy listening on {bound} ({})", addr);
+                    }
+                    Err(e) => {
+                        if addr.is_ipv4() {
+                            warn!("failed to bind IPv4 UDP transparent proxy on {addr}: {e}");
+                        } else {
+                            debug!("IPv6 UDP transparent proxy unavailable on {addr}: {e}");
+                        }
                     }
                 }
             }
         }
+    }
+
+    // 至少要有一个 TCP 透明代理监听真正起来了，否则后面的规则就是把人往黑洞里导
+    if tproxy_port.is_some() && tproxy_listeners.is_empty() {
+        anyhow::bail!(
+            "没有任何 TCP 透明代理监听成功（port={}），拒绝带病启动",
+            tproxy_port.unwrap()
+        );
     }
 
     let dns_addr: Option<SocketAddr> = if args.no_dns {
@@ -237,8 +284,12 @@ async fn main() -> anyhow::Result<()> {
         Some(a) => match cns_client::inbound::bind_relay_socket(a) {
             Ok(s) => Some(s),
             Err(e) => {
-                warn!("failed to bind DNS relay on {a}: {e}");
-                None
+                // 规则会把 UDP/53 导到这里；监听没起来 = 解析全挂但进程还在跑。
+                // 想要"不起 DNS 中继"应该用 --no-dns，而不是让它悄悄失败。
+                anyhow::bail!(
+                    "failed to bind DNS relay on {a}: {e}\n\
+                     规则会把 UDP/53 导到这里，拒绝带病启动（如不需要中继请用 --no-dns）。"
+                );
             }
         },
         None => None,
@@ -304,6 +355,17 @@ async fn main() -> anyhow::Result<()> {
         handles.push(tokio::spawn(run_tproxy_listener(listener, port, mode, rt, sem, shutdown)));
     }
 
+    for (sock, port) in udp_tproxy_sockets {
+        let cfg = Arc::clone(&config);
+        let cph = Arc::clone(&cipher);
+        handles.push(tokio::spawn(async move {
+            let relay = UdpTproxyRelay::new(cfg, cph, port);
+            if let Err(e) = relay.run_loop_with_socket(Arc::new(sock)).await {
+                warn!("UDP tproxy relay error: {e}");
+            }
+        }));
+    }
+
     if let Some(sock) = dns_listener {
         let cfg = Arc::clone(&config);
         let cph = Arc::clone(&cipher);
@@ -341,12 +403,25 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
-    tokio::select! {
-        res = tokio::signal::ctrl_c() => {
-            if let Err(e) = res {
-                error!("signal handler error: {e}");
+    // 模块脚本用的是 `kill`（SIGTERM），只处理 ctrl_c() 等于永远走不到下面的
+    // drain/删 pid 逻辑，还会让 KSU/Magisk 每 2 秒补一次 kill -9。
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                if let Err(e) = res {
+                    error!("signal handler error: {e}");
+                }
             }
+            _ = sigterm.recv() => info!("SIGTERM received"),
+            _ = sighup.recv() => info!("SIGHUP received (no live reload, shutting down)"),
         }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
     }
 
     info!("shutdown signal received, draining sessions...");

@@ -21,8 +21,11 @@ SYSTEMD_FILE="/etc/systemd/system/cns-server.service"
 OPENRC_FILE="/etc/init.d/cns-server"
 LOG_FILE="/var/log/cns-server.log"
 
-GITHUB_RAW="https://raw.githubusercontent.com/zsx0809/cns-rs/main"
-GITHUB_PROXY_RAW="https://ghfast.top/https://raw.githubusercontent.com/zsx0809/cns-rs/main"
+GITHUB_RAW_ROOT="https://raw.githubusercontent.com/zsx0809/cns-rs/main"
+GITHUB_PROXY_ROOT="https://ghfast.top/https://raw.githubusercontent.com/zsx0809/cns-rs/main"
+# 产物在仓库的 dist/ 下（v0.3.1 起从仓库根移入），raw 路径必须带这个前缀
+GITHUB_RAW="${GITHUB_RAW_ROOT}/dist"
+GITHUB_PROXY_RAW="${GITHUB_PROXY_ROOT}/dist"
 
 color_echo() {
     echo -e "${1}${2}${PLAIN}"
@@ -197,17 +200,23 @@ show_banner() {
 
 # ============ 二进制来源清单与校验 ============
 # 三件套（cns-server-x86_64 / cns-server-aarch64 / cns-client-aarch64）与
-# sha256sums.txt 都在**仓库根目录**入库（见 .gitignore 的 !/cns-server-*）。
-# 旧版这里下的是 raw/main/bin/cns-server-<arch>：仓库里从来没有 bin/ 目录
-# （.gitignore 只跟踪根目录一份），那两个 URL 每次安装必然 404 一轮才落到
-# Releases，白等两次超时。现在按「raw 根目录 -> Releases -> raw 加速镜像」排序。
+# sha256sums.txt 都在**仓库 dist/ 目录**入库（见 .gitignore 的 !/dist/cns-server-*）。
+# 所以 raw 下载路径必须带 dist/ 前缀，见上面的 GITHUB_RAW / GITHUB_PROXY_RAW。
+# 旧版这里下的是 raw/main/bin/cns-server-<arch>（更早是 raw/main/cns-server-<arch>）：
+# 仓库里没有 bin/ 目录、v0.3.1 起根目录也不再放产物，前缀对不上的 URL 每次安装
+# 必然 404 一轮才落到 Releases，白等两次超时。
+# 顺序：raw 的 dist/ -> Releases -> raw 加速镜像(dist/) -> 根目录旧位置（过渡兜底）。
+# 最后那两条只在「脚本已更新、仓库还没推送 dist/」的窗口期起作用（实测远端根目录
+# 旧清单与新产物的哈希一致，兜底不会装到过期版本）；确认远端 dist/ 可访问后即可删。
 binary_urls() {
     # $1 = 文件名
     local name="$1"
     printf '%s\n' \
         "${GITHUB_RAW}/${name}" \
         "https://github.com/zsx0809/cns-rs/releases/latest/download/${name}" \
-        "${GITHUB_PROXY_RAW}/${name}"
+        "${GITHUB_PROXY_RAW}/${name}" \
+        "${GITHUB_RAW_ROOT}/${name}" \
+        "${GITHUB_PROXY_ROOT}/${name}"
 }
 
 fetch_one() {
@@ -234,7 +243,7 @@ verify_sha256() {
     # 静默取清单：二进制那一步已经打印过来源了，这里再刷三行「尝试下载」纯属噪音
     if ! fetch_one "sha256sums.txt" "$man" >/dev/null 2>&1; then
         color_echo "$RED" "❌ 无法获取 sha256sums.txt，拒绝安装未校验的二进制。"
-        color_echo "$YELLOW" "   离线安装方式：先把 cns-server-${TARGET_ARCH} 与本脚本放在同一目录再执行。"
+        color_echo "$YELLOW" "   离线安装方式：把 cns-server-${TARGET_ARCH} 放到本脚本同目录的 dist/ 下（或直接与本脚本同级）再执行。"
         rm -f "$man"
         return 1
     fi
@@ -269,22 +278,20 @@ download_binary() {
     color_echo "$YELLOW" "正在获取适合当前系统的静态二进制服务端 (架构: ${TARGET_ARCH})..."
 
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
-    LOCAL_DIRECT="${SCRIPT_DIR}/cns-server-${TARGET_ARCH}"
-    # bin/ 是历史镜像目录，v0.2.x 起产物只在根目录存一份；留着只为兼容旧克隆
-    LOCAL_BIN="${SCRIPT_DIR}/bin/cns-server-${TARGET_ARCH}"
+    # dist/ 是权威位置（README 与 raw 下载路径都指向它）
+    LOCAL_CANDS=(
+        "${SCRIPT_DIR}/dist/cns-server-${TARGET_ARCH}"
+        # 后两个只为兼容旧克隆：v0.2.1 起产物在仓库根存一份，更早还有 bin/ 镜像
+        "${SCRIPT_DIR}/cns-server-${TARGET_ARCH}"
+        "${SCRIPT_DIR}/bin/cns-server-${TARGET_ARCH}"
+    )
 
-    # 根目录优先：那是 README/install 指向的权威位置
-    if [ -f "$LOCAL_DIRECT" ]; then
-        color_echo "$GREEN" "✓ 发现本地已存在预编译二进制: $LOCAL_DIRECT"
-        install -m 755 "$LOCAL_DIRECT" "$BIN_PATH"
+    for cand in "${LOCAL_CANDS[@]}"; do
+        [ -f "$cand" ] || continue
+        color_echo "$GREEN" "✓ 发现本地已存在预编译二进制: $cand"
+        install -m 755 "$cand" "$BIN_PATH"
         return 0
-    fi
-
-    if [ -f "$LOCAL_BIN" ]; then
-        color_echo "$GREEN" "✓ 发现本地已存在预编译二进制: $LOCAL_BIN"
-        install -m 755 "$LOCAL_BIN" "$BIN_PATH"
-        return 0
-    fi
+    done
 
     local BIN_NAME="cns-server-${TARGET_ARCH}"
     TMP_BIN="/tmp/${BIN_NAME}.$$"
@@ -679,7 +686,7 @@ update_cns_server() {
 
     echo -e "● 当前已安装版本: ${YELLOW}${CURRENT_VER}${PLAIN} (特征码: ${LOCAL_HASH:0:8})"
 
-    # 尝试多源获取最新远程静态二进制（顺序与安装路径一致：根目录 -> Releases -> 加速镜像）
+    # 尝试多源获取最新远程静态二进制（顺序与安装路径一致：dist/ -> Releases -> 加速镜像）
     local UP_NAME="cns-server-${TARGET_ARCH}"
     TMP_BIN="/tmp/cns-server-update-${TARGET_ARCH}.$$"
     if ! fetch_one "$UP_NAME" "$TMP_BIN"; then

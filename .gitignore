@@ -16,15 +16,21 @@ android-module/modes/英国.json
 # 本地构建配置：镜像源/链接器因人而异，不入库
 .cargo/
 
-# 产物：根目录三件套必须入库（install.sh 与 README 下载链接直接指向它们）
-!/cns-server-x86_64
-!/cns-server-aarch64
-!/cns-client-aarch64
+# 产物：dist/ 三件套必须入库（install.sh 的 raw 下载路径与 README 都指向 dist/）
+# v0.3.1 起产物从仓库根移进 dist/，反白名单必须跟着带目录前缀，否则
+# 「文件已入库但被规则忽略」会让 git 静默不再跟踪它们（表现为 push 后 GitHub 上没有产物）。
+!/dist/cns-server-x86_64
+!/dist/cns-server-aarch64
+!/dist/cns-client-aarch64
 
-# 校验清单由 build.sh 生成，必须入库供 install.sh 校验使用
-!sha256sums.txt
-!*.sha256
-!cns-rs-v0.1.1-magisk-ksu-arm64.zip
+# 校验清单由 scripts/build.sh 生成到 dist/，必须入库供 install.sh 校验使用
+!dist/sha256sums.txt
+# 这里刻意逐个列出，而不是写 !dist/*.sha256：git 里后出现的规则优先，
+# !dist/*.sha256 会把上面的 *.zip.sha256 反向包含进来，于是模块 zip 的
+# 校验文件被静默入库（v0.2.0 的 cns-rs-v0.2.0-*.zip.sha256 就是这么进过库的）。
+!dist/cns-server-x86_64.sha256
+!dist/cns-server-aarch64.sha256
+!dist/cns-client-aarch64.sha256
 
 # Android 交叉编译目录（scripts/build.sh 产出，勿入库）
 /target-android

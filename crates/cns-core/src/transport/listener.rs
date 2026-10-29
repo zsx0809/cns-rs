@@ -86,32 +86,64 @@ pub fn create_tcp_listener(addr: SocketAddr, opts: ListenOptions) -> io::Result<
     }
 
     socket.set_reuse_address(true)?;
+    // 透明代理**不能**开 SO_REUSEPORT。本机实测：现网实例已经占着 0.0.0.0:7750，
+    // 新起的第二个客户端照样 bind 成功、日志干净地正常启动，而内核会把新连接
+    // 轮转分给两个实例 —— 用户看到的是「一半网页打不开 / 偶发连不上」这种查不出来的
+    // 故障，因为两边的日志都正常。关掉它之后第二个实例 bind 失败，配合启动期检查
+    // 直接拒绝运行，把静默分流变成一条明确的报错。
+    //
+    // 服务端仍需要它：双栈监听时 `[::]:port`（不设 V6ONLY）与 `0.0.0.0:port` 同时给出
+    // 必须靠 SO_REUSEPORT 才能共存，所以按 `opts.transparent` 区分。
     #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
-    if let Err(e) = socket.set_reuse_port(true) {
-        debug!("SO_REUSEPORT unavailable: {e}");
+    if !opts.transparent {
+        if let Err(e) = socket.set_reuse_port(true) {
+            debug!("SO_REUSEPORT unavailable: {e}");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if opts.transparent {
         unsafe {
             let one: libc::c_int = 1;
-            let (level, optname, label) = match addr {
-                SocketAddr::V4(_) => (libc::SOL_IP, libc::IP_TRANSPARENT, "IPv4 IP_TRANSPARENT"),
-                SocketAddr::V6(_) => {
-                    (libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, "IPv6 IPV6_TRANSPARENT")
+            const IPV6_TRANSPARENT_OPT: libc::c_int = 75;
+            match addr {
+                SocketAddr::V4(_) => {
+                    let ret = libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_IP,
+                        libc::IP_TRANSPARENT,
+                        &one as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&one) as libc::socklen_t,
+                    );
+                    if ret == 0 {
+                        debug!("IPv4 IP_TRANSPARENT enabled");
+                    } else {
+                        debug!("IPv4 IP_TRANSPARENT rejected: {}", io::Error::last_os_error());
+                    }
                 }
-            };
-            let ret = libc::setsockopt(
-                socket.as_raw_fd(),
-                level,
-                optname,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret == 0 {
-                debug!("{label} enabled");
-            } else {
-                debug!("{label} rejected: {}", io::Error::last_os_error());
+                SocketAddr::V6(_) => {
+                    let ret = libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::IPPROTO_IPV6,
+                        IPV6_TRANSPARENT_OPT,
+                        &one as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&one) as libc::socklen_t,
+                    );
+                    if ret == 0 {
+                        debug!("IPv6 IPV6_TRANSPARENT enabled");
+                    } else {
+                        debug!("IPv6 IPV6_TRANSPARENT rejected: {}", io::Error::last_os_error());
+                    }
+                    if !opts.ipv6_only {
+                        let _ = libc::setsockopt(
+                            socket.as_raw_fd(),
+                            libc::SOL_IP,
+                            libc::IP_TRANSPARENT,
+                            &one as *const _ as *const libc::c_void,
+                            std::mem::size_of_val(&one) as libc::socklen_t,
+                        );
+                    }
+                }
             }
         }
     }
@@ -208,11 +240,31 @@ pub fn tune_tcp_stream(stream: &TcpStream) {
 /// 客户端出站连接：在 connect 前打开 `TCP_FASTOPEN_CONNECT`，
 /// 让首写携带 SYN 数据，真正拿到 0-RTT（旧实现只在服务端开了 TFO，客户端从未使用）。
 pub async fn connect_tfo(addr: SocketAddr, enable_tfo: bool) -> io::Result<TcpStream> {
+    connect_tfo_mss(addr, enable_tfo, 0).await
+}
+
+/// 带 MSS 钳制的出站连接。
+///
+/// `tun_mtu` 非 0 时按 `mss_for_mtu` 推导 MSS，并且**必须在 `connect()` 之前**
+/// 写到 fd 上 —— Linux 只在连接建立前认 `TCP_MAXSEG`，connect 之后再设会被静默
+/// 忽略（`tests::setting_mss_after_connect_does_not_raise_it_back` 把这条语义钉住了）。
+pub async fn connect_tfo_mss(
+    addr: SocketAddr,
+    enable_tfo: bool,
+    tun_mtu: u16,
+) -> io::Result<TcpStream> {
     let socket = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
     let _ = socket.set_nodelay(true);
+
+    if tun_mtu != 0 {
+        let mss = mss::mss_for_mtu(tun_mtu, matches!(addr, SocketAddr::V6(_)));
+        if let Err(e) = mss::set_tcp_maxseg(socket.as_raw_fd(), mss) {
+            debug!("pre-connect TCP_MAXSEG={mss} failed on {addr}: {e}");
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if enable_tfo {
@@ -238,6 +290,15 @@ pub async fn connect_tfo(addr: SocketAddr, enable_tfo: bool) -> io::Result<TcpSt
 
 /// 解析 `host:port` 并对所有候选地址做快速回退连接（IPv6 优先，失败立即试 IPv4）。
 pub async fn connect_any(target: &str, enable_tfo: bool) -> io::Result<TcpStream> {
+    connect_any_mss(target, enable_tfo, 0).await
+}
+
+/// `connect_any` 的带 MSS 版：`tun_mtu` 非 0 时对每个候选地址都在 connect 前钳制。
+pub async fn connect_any_mss(
+    target: &str,
+    enable_tfo: bool,
+    tun_mtu: u16,
+) -> io::Result<TcpStream> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target).await?.collect();
     if addrs.is_empty() {
         return Err(io::Error::new(
@@ -248,7 +309,7 @@ pub async fn connect_any(target: &str, enable_tfo: bool) -> io::Result<TcpStream
 
     let mut last_err = io::Error::other("connect failed");
     for addr in addrs {
-        match connect_tfo(addr, enable_tfo).await {
+        match connect_tfo_mss(addr, enable_tfo, tun_mtu).await {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = e,
         }
@@ -273,6 +334,89 @@ pub fn create_tuned_udp_socket(addr: SocketAddr) -> io::Result<tokio::net::UdpSo
     let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
 
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
+}
+
+/// 创建支持 TPROXY 透明代理与原始目的地址捕获的 UDP 监听 Socket
+pub fn create_udp_tproxy_socket(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    let _ = socket.set_reuse_port(true);
+
+    if let SocketAddr::V6(_) = addr {
+        let _ = socket.set_only_v6(true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        let fd = socket.as_raw_fd();
+        let one: libc::c_int = 1;
+        const IPV6_TRANSPARENT_OPT: libc::c_int = 75;
+        const IPV6_RECVORIGDSTADDR_OPT: libc::c_int = 74;
+        const IPV6_RECVPKTINFO_OPT: libc::c_int = 37;
+
+        match addr {
+            SocketAddr::V4(_) => {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    libc::IP_TRANSPARENT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    libc::IP_RECVORIGDSTADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    libc::IP_PKTINFO,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+            }
+            SocketAddr::V6(_) => {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    IPV6_TRANSPARENT_OPT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    IPV6_RECVORIGDSTADDR_OPT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    IPV6_RECVPKTINFO_OPT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                );
+            }
+        }
+    }
+
+    let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
 

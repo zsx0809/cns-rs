@@ -684,11 +684,16 @@ mod tests {
         assert!(!d.is_fakeip_leak("1.1.1.1".parse().unwrap()));
     }
 
-    /// 当前部署参数必须原样可读（config.json 里是真实值，不是占位符）
+    /// 当前部署参数必须原样可读（configs/server.json 里是真实值，不是占位符）
+    ///
+    /// 路径随目录整理从根 `config.json` 移到 `configs/server.json`；顺带去掉原来的
+    /// `else { return }` —— 它会让"文件被挪走/改名"这类问题变成静默跳过，
+    /// 而这条测试的存在意义就是防止部署参数与代码脱节。
     #[test]
     fn deployed_config_json_still_validates() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.json");
-        let Ok(raw) = fs::read_to_string(&path) else { return };
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/server.json");
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读不到部署配置 {}: {e}", path.display()));
         let cfg: Config = serde_json::from_str(&raw).unwrap();
         cfg.validate().expect("deployed config.json must pass validation");
         assert_eq!(cfg.listen_addr, vec!["[::]:21200"]);

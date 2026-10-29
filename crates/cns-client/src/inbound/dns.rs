@@ -202,7 +202,15 @@ impl LocalDnsRelay {
         let upstream = match self.pick_upstream(orig_dst) {
             Some(u) => u,
             None => {
-                debug!("no usable DNS upstream (orig_dst={orig_dst})");
+                // 这条是「orig 模式拿不到原始 DNS 上游」的唯一症状，必须在默认
+                // warn 级别下可见（warn_once 防刷屏）。
+                warn_once(
+                    "dns-no-upstream",
+                    &format!(
+                        "DNS 没有可用上游（orig_dst={orig_dst} 既不是可用的 DNS 目标，\
+                         dns_upstream 也为空）——请检查 dns_mode 与 dns_upstream 配置"
+                    ),
+                );
                 self.stats.failures.fetch_add(1, Ordering::Relaxed);
                 return Err(io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
@@ -474,6 +482,11 @@ fn send_transparent_dns_reply(
         };
         let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
             .map_err(|e| io::Error::new(e.kind(), format!("udp new: {e}")))?;
+
+        // REDIRECT 模式下 orig_dst 常常就是本机中继自己的监听地址，而中继 socket
+        // 已经占着那个 addr:port；不给回包 socket 加 SO_REUSEADDR 时 bind 必然
+        // EADDRINUSE，每条应答都会白白多建一次 socket 再降级到 raw/relay 路径。
+        let _ = sock.set_reuse_address(true);
 
         unsafe {
             let fd = sock.as_raw_fd();
@@ -888,28 +901,32 @@ fn is_link_local_v6(v6: std::net::Ipv6Addr) -> bool {
 
 fn local_interface_addresses() -> tokio::task::JoinHandle<Vec<IpAddr>> {
     tokio::task::spawn_blocking(|| {
+        // `/proc/net/if_inet6` 是**文件**不是目录：旧实现对它 read_dir，永远失败，
+        // 于是 `has_global_v6` 恒为 false，`block_ipv6=true` 的告警从来没打出来过。
+        // 每行形如 `00000000000000000000000000000001 01 80 10 80       lo`。
         let mut out = Vec::new();
-        if let Ok(d) = std::fs::read_dir("/proc/net/if_inet6") {
-            for entry in d.flatten() {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    for line in content.lines() {
-                        let f: Vec<&str> = line.split_whitespace().collect();
-                        if let Some(hex) = f.first() {
-                            if hex.len() == 32 {
-                                if let Ok(bytes) = <[u8; 16]>::try_from(
-                                    (0..16)
-                                        .map(|i| {
-                                            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                                                .unwrap_or(0)
-                                        })
-                                        .collect::<Vec<u8>>(),
-                                ) {
-                                    out.push(IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
-                                }
-                            }
-                        }
+        let content = match std::fs::read_to_string("/proc/net/if_inet6") {
+            Ok(c) => c,
+            Err(_) => return out,
+        };
+        for line in content.lines() {
+            let hex = match line.split_whitespace().next() {
+                Some(h) if h.len() == 32 => h,
+                _ => continue,
+            };
+            let mut bytes = [0u8; 16];
+            let mut ok = true;
+            for i in 0..16 {
+                match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                    Ok(b) => bytes[i] = b,
+                    Err(_) => {
+                        ok = false;
+                        break;
                     }
                 }
+            }
+            if ok {
+                out.push(IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
             }
         }
         out
