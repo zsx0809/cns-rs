@@ -107,21 +107,36 @@ Android 内核严格校验 DNS 回包源地址，非 `orig_dst` 的回包会被�
 
 ## 📦 产物与部署
 
-**产物只存放在仓库根目录一份**（v0.2.1 起不再镜像到 `bin/`，也不在模块源码目录里保存二进制副本 —— 同一二进制存 3~4 份既显杂乱又容易装到过期版本；`install.sh` 的下载源也据此统一指向根目录与 Releases）：
+仓库根目录只留源码、脚本与配置，发布产物集中到一个目录里：
 
-| 根目录文件 | 目标三元组 | 链接方式 | 用途 |
+```text
+cns-rs/
+├── dist/            # 唯一产物目录：二进制 + 校验清单（入库，install.sh 从这里 raw 下载）
+│   ├── cns-server-x86_64 / cns-server-aarch64 / cns-client-aarch64
+│   ├── <产物>.sha256        # 与产物同名的单文件校验值，便于离线核对
+│   └── sha256sums.txt        # install.sh 的校验依据
+├── configs/         # 配置样例：client.json（手机端）、server.json（VPS 端）
+├── scripts/         # build.sh / build_module.py / bench.sh / zig-musl-cc.py
+├── android-module/  # Magisk / KernelSU / APatch 模块源码（源码目录内不存二进制副本）
+├── crates/          # Rust workspace
+└── install.sh       # 对外安装入口，必须留在根目录（README 的 curl .../main/install.sh 指向它）
+```
+
+**产物只存放在 `dist/` 一份**（v0.2.1 起不再镜像到 `bin/`，也不在模块源码目录里保存二进制副本 —— 同一二进制存 3~4 份既显杂乱又容易装到过期版本；v0.3.1 起把唯一那份从仓库根移进 `dist/`，根目录只剩源码与脚本、一眼能分辨哪个是产物，`install.sh` 的 raw 下载路径与 Releases 资产名据此统一）：
+
+| dist/ 文件 | 目标三元组 | 链接方式 | 用途 |
 | :--- | :--- | :--- | :--- |
 | `cns-server-x86_64` | `x86_64-unknown-linux-musl` | **静态** | VPS 服务端（主流方案） |
 | `cns-server-aarch64` | `aarch64-unknown-linux-musl` | **静态** | ARM 服务器 / 小鸡 / OpenWrt |
 | `cns-client-aarch64` | `aarch64-linux-android` | 动态（`/system/bin/linker64`） | 手机客户端，打包时注入模块 zip |
-| `sha256sums.txt` | — | — | `install.sh` 下载校验依据 |
+| `sha256sums.txt` | — | — | `install.sh` 下载校验依据（另有三份同名 `.sha256`） |
 
 ```bash
-bash scripts/build.sh                 # 构建全部三个产物 + 生成 sha256sums.txt
+bash scripts/build.sh                 # 构建全部三个产物到 dist/ + 生成 sha256sums.txt
 bash scripts/build.sh --server-only   # 只要服务端
 bash scripts/build.sh --client-only   # 只要手机客户端
-bash scripts/build.sh --clean         # 构建后清理 target/ 释放空间
-python3 build_module.py               # 打包模块 zip（自动取根目录的 cns-client-aarch64）
+bash scripts/build.sh --clean         # 构建后清理 target/ 释放空间（dist/ 产物保留）
+python3 scripts/build_module.py       # 打包模块 zip（自动取 dist/cns-client-aarch64，产物写回 dist/）
 ```
 
 `scripts/build.sh` 会**断言**服务端产物为 `statically linked`、客户端产物为 Android aarch64，并对同架构产物实跑 `--version` 自检；不满足即中止 —— 避免把 bionic 二进制装到 Ubuntu 上（这是 v0.1.x 的真实故障：仓库里的 `cns-server-aarch64` 实际是 Android 动态链接产物，标称"纯静态"却根本跑不起来）。
@@ -136,14 +151,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zsx0809/cns-rs/main/install.
 
 脚本行为：
 * 识别发行版与架构，配置 systemd / OpenRC 守护与开机自启；
-* 预编译静态二进制按 **仓库根目录（raw）→ GitHub Releases → 加速镜像** 顺序获取，并与 `sha256sums.txt` 逐字节比对；**取不到清单或校验不通过即拒绝安装**（旧版从不存在的路径 `raw/main/bin/…` 起猜、且完全不校验）；
+* 预编译静态二进制从 **`dist/`（raw）→ GitHub Releases → 加速镜像** 顺序获取，并与 `sha256sums.txt` 逐字节比对；**取不到清单或校验不通过即拒绝安装**（旧版从不存在的路径 `raw/main/bin/…` 起猜、且完全不校验）；
 * 交互式设置端口/口令/伪装域名，结束后打印可直接粘进手机模块的配置块；
 * `bash install.sh update` 原子替换并重启（先停服务再覆盖，避免 `ETXTBSY`），更新同样走 SHA-256 校验；
 * 安装与更新结束后执行 `verify_running()`：确认进程活着 **且** `listen_addr` 的端口真的处于 LISTEN
   （`ss` → `netstat` → `/proc/net/tcp*` 状态 `0A` 三级兜底）。「进程在跑但一个端口都没 bind 上」
   在旧版会被打印成「安装成功」，客户端侧则表现为永远连不上。
 
-服务端 `config.json`（全部字段可省略，省略即取默认）：
+服务端 `configs/server.json`（全部字段可省略，省略即取默认；仓库里这份是当前部署参数的样例）：
 
 ```json
 {
@@ -180,8 +195,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zsx0809/cns-rs/main/install.
 ## 📱 Android 模块
 
 ```bash
-python3 build_module.py          # 自动使用根目录 cns-client-aarch64
-# 产物：cns-rs-v0.2.1-magisk-ksu-apatch-arm64.zip (+ .sha256)
+python3 scripts/build_module.py  # 自动使用 dist/cns-client-aarch64
+# 产物：dist/cns-rs-v<版本>-magisk-ksu-apatch-arm64.zip (+ .sha256)
 ```
 
 在 Magisk / KernelSU / APatch 中刷入，模块安装到 `/data/adb/modules/cns_rs/`（另有软链接 `/data/免流模式/`）。
@@ -240,12 +255,16 @@ KSU / APatch 可在模块列表点【操作 / Action】一键开关。
   "dns_upstream": ["223.5.5.5:53", "8.8.8.8:53"],
   "block_ipv6": true,
   "dns_cache_size": 2048,
-  "buffer_pool_cap": 64
+  "buffer_pool_cap": 64,
+  "tun_mtu": 1350
 }
 ```
 
 * `dns_mode: orig`（默认）沿用 App 原本要查的 DNS（`IP_RECVORIGDSTADDR` 捕获），这是运营商 DNS 劫持/分流场景唯一正确的做法；`fixed` 则恒用 `dns_upstream`。v0.1.x 辛苦取出的 `orig_dst` 被完全忽略、写死 `8.8.8.8:53`，国内 VPS 上直接解析全挂。
+  **注意**：`tproxy_mode: redirect` 与 `dns_mode: orig` 是**互斥**组合 —— REDIRECT 会把目的地址改写成中继自己的地址，本地中继拿不到 App 原本要查的 DNS，`orig` 必然失效并回落到 `dns_upstream`。这一组合现在会在启动时明确告警；内网/local 域名要按原样解析，请在该模式 JSON 里写 `dns_mode: "fixed"` 并显式列出上游。
+* `tun_mtu`：**非 0 时**按它推导 MSS（v4 = `tun_mtu - 40`，v6 = `tun_mtu - 60`）并**在 connect 之前**下发 `TCP_MAXSEG` 到出站隧道 socket。这是 v0.3.1 补上的客户端侧 MTU 黑洞治理（v0.3.0 只做了服务端那条腿）。`0`（默认）= 不钳制、保持历史行为；蜂窝链路建议 `1350`，范围 1280..=1500。装到手机上更省心的做法是用模块的 `modes/<模式>.json`（出厂样例已写 `1350`）。
 * `gid: 3004` 必须保留并配合脚本里的 `--gid-owner` 白名单，否则回环。**进程先建好所有监听 socket、之后才切 GID**（顺序反了会把监听口自己抓进 REDIRECT）。
+* 配置里**不允许出现未知字段**（v0.3.1 起 `deny_unknown_fields`）：写错名字或写了一个并不存在的字段会直接启动失败，而不是静默忽略 —— 后者曾让"按文档配好了却没生效"变成一类查不出来的故障。
 
 ---
 
@@ -271,9 +290,11 @@ iptables: No chain/target/match by that name.   # 内核没有 xt_TCPMSS
 
 对策（全部在代码里，不依赖任何 iptables target）：
 
-* `tun_mtu`（默认 **1300**）→ 监听与出站 socket 在 **connect/listen 之前**下发
-  `TCP_MAXSEG`（v4 1260 / v6 1240）。顺序是硬要求：实测 connect 后再设，
-  内核会按已有路由重夹一次（设 1310 读回 1288），等于没做。
+* `tun_mtu`（**服务端**默认 1300 / **客户端**默认 0=关闭）→ 监听与出站 socket 在
+  **connect/listen 之前**下发 `TCP_MAXSEG`（v4 1260 / v6 1240）。顺序是硬要求：
+  实测 connect 后再设，内核会按已有路由重夹一次（设 1310 读回 1288），等于没做。
+  v0.3.1 起客户端也接了同一条路径（`connect_tfo_mss` / `connect_any_mss`），
+  出厂模块的 `modes/<模式>.json` 写 `tun_mtu: 1350`。
 * 启动时把 `net.ipv4.tcp_mtu_probing` 置 1，作为「路径中段更小」时的第二道防线。
 * `--stats` 会打印 `mtu=1300 mss(v4=1260 v6=1240)` 与本机**最小可用接口 MTU**，
   部署者据此调 `tun_mtu`（可写 1280..1500，0 = 关闭钳制）。
@@ -336,15 +357,24 @@ v0.1.x 的 `--tun` 实现只处理 UDP/53，其余 IP 报文全部丢弃——�
 ## 🧪 测试与验证
 
 ```bash
-cargo test --workspace --all-targets          # 单元 + 真实服务端集成 + 端到端
-bash scripts/addr_parity.sh                   # shell ↔ Rust 地址解析一致性（36 条语料）
-sh  android-module/Core/cns_rules.sh selftest # 模块脚本纯函数自检，无需 root/网络
+cargo test --workspace --all-targets          # 单元 + 真实服务端集成 + 端到端（250 项）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-bash crates/cns-server/tests/smoke_real_binary.sh cns-server-aarch64 cns-client-aarch64
+bash scripts/bench.sh                         # 吞吐 / 建连 / DNS 分位 / RSS / fd
+bash crates/cns-server/tests/smoke_real_binary.sh dist/cns-server-x86_64 dist/cns-client-aarch64
+bash scripts/build.sh --client-only           # 只重建手机客户端（Termux 自带 android 工具链）
+python3 scripts/build_module.py               # 打包模块 zip 到 dist/（自动注入 dist/cns-client-aarch64）
 ```
 
-* **`scripts/addr_parity.sh` 是这个项目最该有、以前却没有的测试。** 同一份 `modes/<模式>.json` 里的 `cns_server` 会被两个实现各解析一遍：`cns_rules.sh` 用它生成 iptables 放行规则和检测 URL，`cns-client` 用它真正拨号。两侧只要有任何分歧，就是「放行的地址 ≠ 连的地址」这种查半天的故障——v0.2.0 的 IPv6 误判正源于此。该脚本把同一批语料喂给两侧并逐条比对 host/端口/地址族/是否失败；已用变异测试验证过它能捕获真实回归（改默认端口、去掉裸 IPv6 消歧、zone id 语义漂移三种注入全部报警）。CI 的 test job 会跑它。
+* **尚未实现（不要照抄）**：早期文档里出现过的 `scripts/addr_parity.sh`（shell ↔ Rust
+  地址解析对拍）与 `cns_rules.sh selftest` 在仓库里**并不存在**。两者要解决的问题是真实的
+  ——同一份 `modes/<模式>.json` 的 `cns_server` 会被 `cns_rules.sh`（生成放行规则与检测
+  URL）和 `cns-client`（真正拨号）各解析一遍，两侧分歧就是「放行的地址 ≠ 连的地址」，
+  v0.2.0 的 IPv6 误判正源于此——但到目前为止是靠 v0.3.1 的结构化自检（`tproxy_mode`
+  与端口的一致性校验、启动期拒绝非法地址）来兜的，独立对拍脚本仍待补。
+* **`cargo test` 现在应当全绿**。此前 `cns-core::transport::mss` 有一条测试在任何非
+  Android 内核上必红（它假设 connect 之后设 `TCP_MAXSEG` 会读回钳制值，而 Linux 只在
+  建连前认这个选项，loopback 上读数就是 32767）——长期红着的 CI 会把真回归淹掉。
 * **`selftest` 会在解析层就拒绝非法地址**（括号不成对、端口越界/前导零/为 0、zone id、裸 IPv6 无法消歧），并逐条校验 `modes/*.json` 生成的 URL 是否真的合规——不联网、不动规则，改完配置先跑它最省事。
 * 集成测试直接起 `cns_server::serve::RunningServer`（真实监听、真实握手），不再手搓 mock——旧测试的 mock 与被测代码不同源，测过不代表能用。
 * 端到端断言包含：IPv4 客户端能连上 `[::]` 监听；粘包 banner 不丢；`httpUDP` 回帧的 IPv4-mapped 地址族被正确规范化（`::ffff:127.0.0.1` 必须写成 addr_type=1，否则客户端按 IPv6 解析丢包——这是本次实现中一个真实的协议 bug）；8 并发查询只建 1 条连接。
@@ -354,3 +384,39 @@ bash crates/cns-server/tests/smoke_real_binary.sh cns-server-aarch64 cns-client-
 ## 📄 License
 
 MIT，见 [LICENSE](LICENSE)。
+
+---
+
+## 🔒 私有资产与运维凭证（仅限本地·红线禁区）
+
+> [!CAUTION]
+> ### 🛑 绝对安全红线 (STRICT RED LINE)
+> **本文件及本仓库的任何文件都不得写入真实凭据。**
+> 仓库管理令牌（PAT）、服务器 IP、SSH 端口与密码一律存放在**仓库之外**
+> （本机 `../服务器访问凭据（勿入库）.md` 或密码管理器）。
+>
+> 历史教训：早期版本曾把两台节点的 IP、SSH 端口和密码写在本文件里，靠
+> `git update-index --assume-unchanged README.md` 这个**约定**勉强挡住提交 ——
+> 但一次 `git add -A` 就能打破它，而泄露一旦进入公开历史就很难真正清除。
+> 现在起：凭据不落仓库，README 里只放占位符。
+
+### 1. GitHub 仓库管理凭证 (PAT)
+* **仓库地址**: `https://github.com/zsx0809/cns-rs.git`
+* **账号**: `zsx0809`
+* **Personal Access Token**: **不写在这里**（见仓库外凭据文件或密码管理器）
+
+### 2. 生产服务端节点资产矩阵
+
+| 节点标识 | 节点 1 (英国 / 主控中继) | 节点 2 (美国 / 落地节点) |
+| :--- | :--- | :--- |
+| **操作系统** | Alpine Linux (OpenRC 服务守护) | Debian Linux (Systemd 服务守护) |
+| **服务名（易错点）** | **`cns`**（`cns-server` 是废弃脚本，永远是 crashed） | `cns-server` |
+| **二进制 / 配置** | `/usr/local/cns/cns-server` + `cns.json` | `/usr/local/bin/cns-server` + `/etc/cns-rs/config.json` |
+| **原生 IPv6 地址** | `<节点 1 IPv6>`（见仓库外凭据文件） | `<节点 2 IPv6>`（见仓库外凭据文件） |
+| **SSH 登录端口** | `22`（公网入口见仓库外凭据文件） | `22`（经节点 1 跳板，已配置公钥互信） |
+| **SSH 用户名** | `root` | `root` |
+| **SSH 密码** | 见仓库外凭据文件 | 见仓库外凭据文件 |
+| **CNS 服务端口** | `13872` (TCP/UDP 双栈) | `13872` (TCP/UDP 双栈) |
+| **CNS 协议版本** | 随 Release 更新 | 随 Release 更新 |
+| **管理捷径** | 见仓库外凭据文件 | 连上节点 1 后直连节点 2 |
+
