@@ -684,24 +684,30 @@ mod tests {
         assert!(!d.is_fakeip_leak("1.1.1.1".parse().unwrap()));
     }
 
-    /// 当前部署参数必须原样可读（configs/server.json 里是真实值，不是占位符）
+    /// 仓库里的服务端样例配置必须能被当前代码解析、展开并通过校验。
     ///
-    /// 路径随目录整理从根 `config.json` 移到 `configs/server.json`；顺带去掉原来的
-    /// `else { return }` —— 它会让"文件被挪走/改名"这类问题变成静默跳过，
-    /// 而这条测试的存在意义就是防止部署参数与代码脱节。
+    /// 这里刻意**不**断言任何部署相关的具体值（端口 / 口令 / 上游 DNS）：
+    /// 样例文件是给人照着改的模板，把某台机器的真实参数（尤其是口令）钉在测试里，
+    /// 等于把生产凭据永久写进公开仓库。
     #[test]
-    fn deployed_config_json_still_validates() {
+    fn sample_config_json_loads_and_validates() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/server.json");
         let raw = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("读不到部署配置 {}: {e}", path.display()));
-        let cfg: Config = serde_json::from_str(&raw).unwrap();
-        cfg.validate().expect("deployed config.json must pass validation");
-        assert_eq!(cfg.listen_addr, vec!["[::]:21200"]);
-        assert_eq!(cfg.encrypt_password, "换成你的口令");
-        assert_eq!(cfg.prefer_family, "auto");
-        assert_eq!(cfg.happy_eyeballs_ms, 200);
-        assert_eq!(cfg.outbound_mss, 1260);
-        assert_eq!(cfg.fakeip_guard_cidrs, vec!["198.18.0.0/15", "fd53::/48"]);
+            .unwrap_or_else(|e| panic!("读不到样例配置 {}: {e}", path.display()));
+        let cfg: Config = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("样例配置不是合法 JSON: {e}"));
+        cfg.validate().expect("样例配置必须通过校验");
+
+        // 样例必须真的可跑：监听项能展开、上游非空、字段齐全
+        assert!(!cfg.listen_addr.is_empty(), "样例必须给出监听地址");
+        assert!(
+            cfg.listen_addr
+                .iter()
+                .all(|s| !cns_core::transport::expand_listen_spec(s).is_empty()),
+            "样例的 listen_addr 必须都能展开成 SocketAddr"
+        );
+        assert!(!cfg.dns_upstream.is_empty(), "样例必须给出 dns_upstream");
+        assert!(!cfg.proxy_key.is_empty(), "样例必须给出 proxy_key");
     }
 
     /// 每个新字段的非法值都必须被拒，且**不静默回落**

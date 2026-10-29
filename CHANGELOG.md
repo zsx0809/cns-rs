@@ -93,6 +93,12 @@
   执行 `bash scripts/build.sh` 必然失败，报的还是 `cc: error: unrecognized
   command-line option '-m64'` 这种与真实原因无关的信息。现在脚本自己把
   `CARGO_TARGET_<TRIPLE>_LINKER` 指向 `scripts/zig-musl-cc.py`。
+- **模块出厂配置关闭 httpUDP 隧道**（`modes/*.json` 的 `enable_udp_tunnel: false`）。
+  受限网络（如停机卡）下 UDP 本身已经是经 TCP 通道承载的，再叠一层 UDP 隧道反而让
+  UDP 被拦，现场表现就是「图片裂开」。需要 UDP 隧道的模式单独打开即可。
+- **服务端样例配置脱敏**（`configs/server.json`）。它此前是某台机器的真实部署快照，
+  连口令一起躺在仓库里；现在是纯模板（口令写 `换成你的口令`、监听写默认端口），
+  对应的测试也不再断言任何具体部署值 —— 只验证「样例能被解析、展开并通过校验」。
 - **配置面硬化**：`ClientConfig` 加 `deny_unknown_fields` —— 此前按文档写
   `fakeip*` / `v6_faithful_ports` 等并不存在的字段会被静默忽略，用户以为生效了。
   现在启动即报错。同时拒绝空 `udp_flag`（空串会让服务端把**每个** TCP 会话判成

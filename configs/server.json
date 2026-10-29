@@ -1,7 +1,5 @@
 {
-  "listen_addr": [
-    "[::]:21200"
-  ],
+  "listen_addr": ["[::]:1254"],
   "proxy_key": "Meng",
   "udp_flag": "httpUDP",
   "encrypt_password": "换成你的口令",
@@ -9,16 +7,9 @@
   "udp_timeout": 30,
   "enable_dns_tcp_over_udp": true,
   "enable_tfo": false,
-  "dns_upstream": [
-    "202.96.128.86:53",
-    "223.5.5.5:53",
-    "8.8.8.8:53"
-  ],
+  "dns_upstream": ["223.5.5.5:53", "8.8.8.8:53"],
   "prefer_family": "auto",
   "outbound_mss": 1260,
-  "fakeip_guard_cidrs": [
-    "198.18.0.0/15",
-    "fd53::/48"
-  ],
+  "fakeip_guard_cidrs": ["198.18.0.0/15", "fd53::/48"],
   "happy_eyeballs_ms": 200
 }

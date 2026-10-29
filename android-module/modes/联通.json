@@ -15,7 +15,7 @@
 
   "gid": 3004,
   "enable_tfo": true,
-  "enable_udp_tunnel": true,
+  "enable_udp_tunnel": false,
   "timeout_seconds": 60,
 
   "dns_mode": "orig",
