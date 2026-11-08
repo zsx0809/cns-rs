@@ -55,7 +55,7 @@ json_get() {
 }
 
 json_get_bool() {
-    sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$1" 2>/dev/null | head -n 1
+    sed -E -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*(true|false).*/\1/p' "$1" 2>/dev/null | head -n 1
 }
 
 # 取数字型字段（JSON 里不带引号的值，如 "gid": 3004）
@@ -455,14 +455,9 @@ start_rules() {
                 esac
             done
 
-            # 2.3 TPROXY 规则注入 (区分 IPv4 与 IPv6 的 --on-ip)
-            if [ "$tool" = "iptables" ]; then
-                add iptables mangle CNS_TP_PRE -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
-                add iptables mangle CNS_TP_PRE -p udp -j TPROXY --on-ip 127.0.0.1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
-            else
-                add ip6tables mangle CNS_TP_PRE -p tcp -j TPROXY --on-ip ::1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
-                add ip6tables mangle CNS_TP_PRE -p udp -j TPROXY --on-ip ::1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
-            fi
+            # 2.3 TPROXY 规则注入 (严禁加 --on-ip，保留数据包真实目的 IP 与端口，避免篡改目的导致被当作自连回环掐断)
+            add "$tool" mangle CNS_TP_PRE -p tcp -j TPROXY --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
+            add "$tool" mangle CNS_TP_PRE -p udp -j TPROXY --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
             add "$tool" mangle PREROUTING -j CNS_TP_PRE
 
             # 3. OUTPUT 链：拦截本机应用出站流量并打 mark 重新路由至 lo
