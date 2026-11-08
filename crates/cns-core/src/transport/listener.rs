@@ -299,7 +299,9 @@ pub async fn connect_any_mss(
     enable_tfo: bool,
     tun_mtu: u16,
 ) -> io::Result<TcpStream> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target).await?.collect();
+    let normalized = crate::net_addr::normalize_socket_str(target, 1254)
+        .unwrap_or_else(|_| target.to_string());
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&normalized).await?.collect();
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,

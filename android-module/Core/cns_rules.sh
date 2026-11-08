@@ -432,8 +432,20 @@ start_rules() {
             $tool -w -t mangle -N CNS_TP_PRE 2>/dev/null
             $tool -w -t mangle -F CNS_TP_PRE
 
-            # 2.1 放行自身 GID 与基础端口（53 端口直连放行，核心铁律：防丢包与源地址错乱）
-            add "$tool" mangle CNS_TP_PRE -m owner --gid-owner "$GID_OWNER" -j RETURN 2>/dev/null || true
+            # 2.0 核心铁律：非 mark 流量（外网入站、服务端回包等）严禁进入 TPROXY，直接放行
+            # 只有本机应用在 OUTPUT 链被打上 0x1/0x1 标记并 reroute 到 lo 的出站流量才允许进入 TPROXY！
+            add "$tool" mangle CNS_TP_PRE -m mark ! --mark 0x1/0x1 -j RETURN
+
+            # 2.1 服务端回包放行（双重保险：源端口 sport 为服务端端口、源地址 s 为服务端 IP）
+            add "$tool" mangle CNS_TP_PRE -p tcp --sport "$SERVER_PORT" -j RETURN
+            for ip in $SERVER_IPS; do
+                case "$ip" in
+                    *:*) [ "$tool" = "ip6tables" ] && add "$tool" mangle CNS_TP_PRE -s "$ip" -p tcp -j RETURN ;;
+                    *)   [ "$tool" = "iptables" ]  && add "$tool" mangle CNS_TP_PRE -s "$ip" -p tcp -j RETURN ;;
+                esac
+            done
+
+            # 2.2 基础协议与放行端口（53 端口直连、DHCP、NDP、代理端口自身）
             add "$tool" mangle CNS_TP_PRE -p udp --dport 53 -j RETURN
             add "$tool" mangle CNS_TP_PRE -p tcp --dport 53 -j RETURN
             if [ "$tool" = "iptables" ]; then
@@ -446,14 +458,6 @@ start_rules() {
             add "$tool" mangle CNS_TP_PRE -p tcp --dport "$tproxy_port" -j RETURN
             add "$tool" mangle CNS_TP_PRE -p udp --dport "$DNS_PORT" -j RETURN
             [ -n "$SOCKS_PORT" ] && add "$tool" mangle CNS_TP_PRE -p tcp --dport "$SOCKS_PORT" -j RETURN
-
-            # 2.2 服务端 IP 放行
-            for ip in $SERVER_IPS; do
-                case "$ip" in
-                    *:*) [ "$tool" = "ip6tables" ] && add "$tool" mangle CNS_TP_PRE -d "$ip" -p tcp -j RETURN ;;
-                    *)   [ "$tool" = "iptables" ]  && add "$tool" mangle CNS_TP_PRE -d "$ip" -p tcp -j RETURN ;;
-                esac
-            done
 
             # 2.3 TPROXY 规则注入 (严禁加 --on-ip，保留数据包真实目的 IP 与端口，避免篡改目的导致被当作自连回环掐断)
             add "$tool" mangle CNS_TP_PRE -p tcp -j TPROXY --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
