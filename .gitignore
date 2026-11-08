@@ -7,6 +7,7 @@
 android-module/modes/美国.json
 android-module/modes/英国.json
 *.secret.json
+android-module/Core/cns-client
 
 # 模块包与校验清单随 release 发布，不进版本库历史（二进制体积大且每次重编都变）
 *.zip

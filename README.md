@@ -20,7 +20,7 @@
 | :--- | :--- | :--- | :--- |
 | 运行模型 | Go GC + 每连接 goroutine | Tokio 单线程调度、无 GC 抖动 | 语言层事实 |
 | 转发热路径 | 每包一次日志/拷贝 | 原位异或 + 32KB 缓冲池复用（`BufferPool`） | `cns-core::transport::pump` |
-| 代理入口 | TUN 虚拟网卡（用户态拷贝） | v4 走 **内核 NAT REDIRECT**，v6 走 **fakeip + `table local` 路由**（无需 ip6tables nat） | 见「v0.3.0：fakeip」 |
+| 代理入口 | TUN 虚拟网卡（用户态拷贝） | 支持 **REDIRECT 模式**（v4 内核 NAT）与 **TPROXY 模式**（v4/v6 原生透明代理 + 策略路由，DNS 53 直连放行） | 见「IPv6 支持与 TPROXY 模式」 |
 | DNS 隧道 | 每个查询新建一条 TCP 连接并完整握手 | **隧道复用 + 本地缓存**，一条连接跑并发查询 | `cns-client::outbound::mux` |
 | DNS 上游 | 由客户端随意指定 | 服务端配置为权威 + 客户端可选沿用 App 原始目标 | `dns_mode: orig\|fixed` |
 | 半关闭 | `try_join!`：单向 EOF 掐断另一向 | `join!` + 显式 `shutdown`，SSH/HTTPS banner 不丢 | `pump.rs` 有回归测试 |
@@ -299,29 +299,19 @@ iptables: No chain/target/match by that name.   # 内核没有 xt_TCPMSS
 * `--stats` 会打印 `mtu=1300 mss(v4=1260 v6=1240)` 与本机**最小可用接口 MTU**，
   部署者据此调 `tun_mtu`（可写 1280..1500，0 = 关闭钳制）。
 
-### 2. IPv6 无法劫持（症状：v6 目标要么直连绕开隧道，要么全挂）
+### 2. IPv6 支持与 TPROXY 模式（解开误解：真实内核原生支持）
 
-这台机器的 `ip6tables -t nat` **表不存在**，`ip6tables -t mangle` 的
-`MARK / REDIRECT / TPROXY` 也全部 `No chain/target/match` —— v4 的 REDIRECT 方案
-在 v6 上无解。现在改用 **fakeip + `table local` 路由**：
+> **关键认知澄清**：
+> 早期版本曾误认为"系统没有 ip6tables 且 mangle/TPROXY 全部不可用"。经深入排查发现：
+> 1. **命令路径**：Android 系统的绝对路径是 `/system/bin/ip6tables`（指向 iptables 的符号链接）。在 Termux 或精简 shell 下若 PATH 缺失 `/system/bin` 会导致命令找不到。脚本现已强行补全 `export PATH="/system/bin:/system/xbin:$PATH"`。
+> 2. **内核真实能力**：Android 内核确实**没有编译 `ip6table_nat`**，因此 IPv6 **确实无法使用 REDIRECT 模式**（REDIRECT 强依赖 nat 表）；但 Android 内核**完整支持 `ip6table_mangle` 以及 `xt_TPROXY` target**！
+> 3. **DNS 53 直连放行铁律**：无论 REDIRECT 还是 TPROXY 模式，**UDP/TCP 53 端口一律直连放行（RETURN），不进入免流隧道**。这一设计避免了 Android `rp_filter`（反向路径过滤）源地址错乱丢包，并彻底消除了 DNS 走隧道查上游带来的解析延迟，网页首包秒开。
 
-```text
-ip route    add local 198.18.0.0/15 dev lo table local    # v4 假地址
-ip -6 route add local <fakeip_v6>/64 dev lo table local   # v6 假地址
-```
-
-* **必须 `table local`（pref 0）**。Android netd 在 pref 11000~29040 之间塞了
-  per-UID/netid 策略路由，下进 `main` 表会被它们抢先劫走 —— 这正是
-  「fakeip 在浏览器里能用、在某些 App 里失灵」的唯一原因。
-* 实测：加上之后，root 与普通 UID（10170 / 10234）连 `198.18.0.77:14461`、
-  `fd53::77:14462` 都落到本机通配监听，`accept()` 的 `local_addr` **就是原始目的地址**。
-* `local` 路由**不改写目的端口**，所以 IPv6 需要「端口忠实监听」
-  `v6_faithful_ports`（默认 443/80/8080/8443）。这些监听**强制 `IPV6_V6ONLY`**：
-  否则双栈 `[::]:443` 会抢走本该由 REDIRECT 处理的 v4 流量。
-* `fakeip_v6_from_own_prefix=true`（默认）时，v6 假地址段从**本机自己的 /48**
-  推导（只占一个 /64）。理由不是洁癖：万一路由没下成功，落回本机前缀的包最坏是超时；
-  而 ULA 段（`fd53::`）一旦漏劫持就是永远不可达的黑洞地址，部分栈会因此
-  把 AAAA 结果整体拉黑、退回 IPv4-only —— 图片加载失败又回来了。
+在 `tproxy_mode: "tproxy"` 且 `block_ipv6: false` 下：
+* **入站 PREROUTING**：IPv4 与 IPv6 流量分别经由 `iptables` / `ip6tables` mangle 链打上 TPROXY 标签推向本地透明代理监听端口（`0.0.0.0:7750` 与 `[::]:7750`）。
+* **出站 OUTPUT**：本机 App 的出站 TCP/UDP 流量打上 `0x1/0x1` mark，配合策略路由 `ip -6 rule add fwmark 0x1/0x1 lookup 100` 与 `ip -6 route add local ::/0 dev lo table 100` 拦截。
+* **协议保活**：放行 DHCPv6（546:547 端口）与 ICMPv6 邻居发现协议（NDP），保证移动网络与路由通告完全正常。
+* **按需促退**：仅在 REDIRECT 模式或配置开启 `block_ipv6: true` 时才启用 `CNS_V6_OUT` 链快速促退（REJECT）IPv6，保证双栈 App 零等待回退 IPv4；在 TPROXY 模式下全量放行 IPv6 代理！
 
 ### 效果（同一台机器实测）
 

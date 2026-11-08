@@ -18,9 +18,11 @@
 #   7. QUIC 拦截策略与 block_ipv6 联动：
 #      blockQuic=1 且模式 JSON 的 block_ipv6=true 时用 -j DROP（软失败，促 App 按
 #      「网络慢」回退 TCP），否则维持 REJECT；stop 路径把 DROP / REJECT 两种形态全清。
-#   8. IPv6 能力分开探测：本机实测 ip6tables **没有 nat 表**，v6 无法做 REDIRECT，
-#      因此 HAS_V6_NAT / HAS_V6_MANGLE / HAS_V6_FILTER 三个能力位分开判断，
-#      QUIC 拦截（filter 表）不再被 nat 的探测结果误杀。
+#   8. IPv6 能力分开探测：本机实测 ip6tables **没有 nat 表**，v6 无法做 REDIRECT；
+#      但 TPROXY 走 mangle 表，v6 在 mangle/TPROXY 上完全可用！
+#      因此按 tproxy_mode 动态绑定能力，TPROXY 模式下全量启用 IPv6 透明代理与策略路由。
+
+export PATH="/system/bin:/system/xbin:/sbin:/data/data/com.termux/files/usr/bin:$PATH"
 
 DIR="${0%/*}"
 cd "$DIR" || exit 1
@@ -74,11 +76,10 @@ port_of() {
 }
 
 # ---------- 内核能力探测 ----------
-# 注意（本机实测）：Android 内核的 ip6tables **没有 nat 表**，所以
-#   · REDIRECT（nat）模式下 v6 根本无法劫持 -> HAS_V6_NAT=0，ip6tables 整个跳过；
-#   · TPROXY 走 mangle 表，v6 在 mangle 上是可用的（HAS_V6_MANGLE）；
-#   · QUIC 拦截落在 filter 表，与 nat 无关 -> 单独用 HAS_V6_FILTER 判断，
-#     否则「v6 没有 nat」会把一条纯 filter 规则误杀成死代码。
+# 注意：Android 内核的 ip6tables 通常没有 nat 表（ip6table_nat 模块常未编译），所以
+#   · REDIRECT（nat）模式下 v6 无法劫持 -> HAS_V6_NAT=0；
+#   · TPROXY 走 mangle 表，Android 内核的 ip6table_mangle 与 xt_TPROXY 是完全可用的（HAS_V6_MANGLE=1）；
+#   · QUIC 拦截落在 filter 表，与 nat 无关 -> 用 HAS_V6_FILTER 判断。
 probe_v6() {
     HAS_V6_NAT=0; HAS_V6_MANGLE=0; HAS_V6_FILTER=0
     ip6tables -w -t nat -L    >/dev/null 2>&1 && HAS_V6_NAT=1
@@ -87,19 +88,29 @@ probe_v6() {
 }
 
 # ---------- iptables 封装 ----------
-HAS_V6_NAT=0; HAS_V6_MANGLE=0; HAS_V6_FILTER=0
-probe_v6
-# HAS_V6 保持旧语义：REDIRECT 模式下 v6 是否可用（决定 $TOOLS 是否包含 ip6tables）
-HAS_V6="$HAS_V6_NAT"
-TOOLS="iptables"
-[ "$HAS_V6" = "1" ] && TOOLS="iptables ip6tables"
+setup_tools() {
+    probe_v6
+    # 模式感知决策：
+    #   · TPROXY 模式走 mangle 表，只要 mangle 可用（HAS_V6_MANGLE=1），v6 就完全可用！
+    #   · REDIRECT 模式走 nat 表，必须依赖 HAS_V6_NAT=1。
+    if [ "$tproxy_mode" = "tproxy" ]; then
+        HAS_V6="$HAS_V6_MANGLE"
+    else
+        HAS_V6="$HAS_V6_NAT"
+    fi
+    TOOLS="iptables"
+    [ "$HAS_V6" = "1" ] && TOOLS="iptables ip6tables"
 
-# stop 路径的工具集合：比 $TOOLS 更宽。
-# 换过模式 / 换过配置之后，上一条命留下的 v6 规则也必须能被清掉（否则残留断网）。
-TOOLS_CLEAN="iptables"
-if [ "$HAS_V6_NAT" = "1" ] || [ "$HAS_V6_MANGLE" = "1" ] || [ "$HAS_V6_FILTER" = "1" ]; then
-    TOOLS_CLEAN="iptables ip6tables"
-fi
+    # stop 路径的工具集合：比 $TOOLS 更宽。
+    # 换过模式 / 换过配置之后，上一条命留下的 v6 规则也必须能被清掉（否则残留断网）。
+    TOOLS_CLEAN="iptables"
+    if [ "$HAS_V6_NAT" = "1" ] || [ "$HAS_V6_MANGLE" = "1" ] || [ "$HAS_V6_FILTER" = "1" ]; then
+        TOOLS_CLEAN="iptables ip6tables"
+    fi
+}
+
+HAS_V6_NAT=0; HAS_V6_MANGLE=0; HAS_V6_FILTER=0
+setup_tools
 
 # add <tool> <table> <chain> <rule...>：不存在才加，避免重复堆积
 add() {
@@ -368,6 +379,9 @@ start_rules() {
         return 1
     fi
 
+    # 确定模式后重新探测并刷新工具列表与 IPv6 支持位
+    setup_tools
+
     stop_rules >/dev/null 2>&1
 
     echo "🚀 启动 cns-client（TCP:$tproxy_port  DNS:$DNS_PORT  GID:$GID_OWNER  mode:$tproxy_mode）"
@@ -422,7 +436,12 @@ start_rules() {
             add "$tool" mangle CNS_TP_PRE -m owner --gid-owner "$GID_OWNER" -j RETURN 2>/dev/null || true
             add "$tool" mangle CNS_TP_PRE -p udp --dport 53 -j RETURN
             add "$tool" mangle CNS_TP_PRE -p tcp --dport 53 -j RETURN
-            add "$tool" mangle CNS_TP_PRE -p udp --dport 67:68 -j RETURN
+            if [ "$tool" = "iptables" ]; then
+                add "$tool" mangle CNS_TP_PRE -p udp --dport 67:68 -j RETURN
+            else
+                add "$tool" mangle CNS_TP_PRE -p udp --dport 546:547 -j RETURN
+                add "$tool" mangle CNS_TP_PRE -p ipv6-icmp -j RETURN
+            fi
             add "$tool" mangle CNS_TP_PRE -p tcp --dport "$SERVER_PORT" -j RETURN
             add "$tool" mangle CNS_TP_PRE -p tcp --dport "$tproxy_port" -j RETURN
             add "$tool" mangle CNS_TP_PRE -p udp --dport "$DNS_PORT" -j RETURN
@@ -455,7 +474,12 @@ start_rules() {
             add "$tool" mangle CNS_TP_OUT -p udp --dport 53 -j RETURN
             add "$tool" mangle CNS_TP_OUT -p tcp --dport 53 -j RETURN
             add "$tool" mangle CNS_TP_OUT -o lo -m mark ! --mark 0x1/0x1 -j RETURN
-            add "$tool" mangle CNS_TP_OUT -p udp --dport 67:68 -j RETURN
+            if [ "$tool" = "iptables" ]; then
+                add "$tool" mangle CNS_TP_OUT -p udp --dport 67:68 -j RETURN
+            else
+                add "$tool" mangle CNS_TP_OUT -p udp --dport 546:547 -j RETURN
+                add "$tool" mangle CNS_TP_OUT -p ipv6-icmp -j RETURN
+            fi
 
             # 3.2 CNS 服务端 IP/端口放行
             add "$tool" mangle CNS_TP_OUT -p tcp --dport "$SERVER_PORT" -j RETURN
@@ -574,8 +598,20 @@ start_rules() {
             ;;
     esac
 
-    # 8.1 IPv6 全量促退（停机网关阻断 IPv6，0ms 促退使 Happy Eyeballs 瞬间回退 IPv4）
-    if [ "$HAS_V6_FILTER" = "1" ]; then
+    # 8.1 IPv6 促退拦截（仅在无法代理 IPv6 或配置显式阻断 IPv6 时启用）
+    # 规则：
+    #   - REDIRECT 模式下 v6 无法做 NAT 重定向，必须阻断促退回 IPv4；
+    #   - 或者模式配置显式 block_ipv6=true 时，必须阻断；
+    #   - 若为 TPROXY 模式且 block_ipv6=false 且 HAS_V6=1，则 IPv6 正常经 TPROXY 转发，绝不阻断！
+    _v6_block=0
+    _bi=$(json_get_bool "$CONF" block_ipv6)
+    [ -z "$_bi" ] && _bi="true"
+    if [ "$_bi" = "true" ] || [ "$tproxy_mode" != "tproxy" ] || [ "$HAS_V6" != "1" ]; then
+        _v6_block=1
+    fi
+
+    if [ "$_v6_block" = "1" ] && [ "$HAS_V6_FILTER" = "1" ]; then
+        echo "🚧 IPv6 促退阻断: 启用 (tproxy_mode=$tproxy_mode, block_ipv6=$_bi, HAS_V6=$HAS_V6)"
         ip6tables -w -N CNS_V6_OUT 2>/dev/null || true
         ip6tables -w -F CNS_V6_OUT 2>/dev/null || true
         ip6tables -w -A CNS_V6_OUT -o lo -j RETURN
@@ -589,6 +625,11 @@ start_rules() {
         ip6tables -w -A CNS_V6_OUT -j REJECT --reject-with icmp6-port-unreachable
         del_all ip6tables filter OUTPUT -j CNS_V6_OUT
         add ip6tables filter OUTPUT -j CNS_V6_OUT
+    else
+        echo "🌐 IPv6 代理转发: 启用 (TPROXY 模式原生透明代理与策略路由)"
+        del_all ip6tables filter OUTPUT -j CNS_V6_OUT
+        ip6tables -w -F CNS_V6_OUT 2>/dev/null || true
+        ip6tables -w -X CNS_V6_OUT 2>/dev/null || true
     fi
 
     # 9. MSS 钳制，避免跨国链路大包分片丢包
