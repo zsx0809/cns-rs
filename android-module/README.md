@@ -33,24 +33,23 @@ KernelSU / APatch 可在模块列表点【操作 / Action】一键开关。
 > 中文文件名在个别终端 + `su -c` 引号嵌套下编码不稳，因此同时提供 ASCII 别名
 > `start.sh` / `stop.sh` / `status.sh`，内容与中文名脚本完全等价。
 
-## 劫持方式
+## 劫持方式（专注于最稳定的 REDIRECT 模式）
 
-| `config.ini` 中 `tproxy_mode` | 需要的内核能力 | 说明 |
+| 模式 | 实现方式 | 说明 |
 | :--- | :--- | :--- |
-| `redirect`（默认） | `xt_REDIRECT` | Android 内核最普遍支持，绝大多数 ROM 可用 |
-| `tproxy` | `xt_TPROXY` + `ip rule` 策略路由 | 能拿到原始目的地址与真实源端口，支持非本地 socket；部分 ROM 缺模块 |
+| `redirect`（唯一固定） | 内核原生 `nat` 表 `REDIRECT` | 彻底移除脆弱的 TPROXY 策略路由体系，Android 原生支持最稳，零回环死锁 |
 
-`config.ini` 的 `tproxy_mode` 与 `modes/*.json` 的 `tproxy_mode` **必须写成同一个值**，
-否则脚本会在启动前中止（详见下面「已知取舍与联动关系」）。
+> **设计决策**：
+> 早期曾尝试支持 TPROXY 策略路由以劫持本机出站。实测在 Android 宿主环境下，本机 App 出站经策略路由回环至 lo 极易与 Android 系统 Netd 服务的 fwmark 产生位冲突，且入站回包容易被 PREROUTING 误判重复劫持，导致 TCP 三次握手无法完成（HTTP/HTTPS 全网断流）。因此，本模块彻底移除了复杂的 TPROXY 策略路由，专注于 Linux/Android 内核最成熟、最可靠的 NAT REDIRECT 模式。
 
-## 防回环机制
+## 防回环与 DNS 直连放行机制
 
-`cns-client` 以 GID 3004 运行，iptables 第一条规则就是
-`-m owner --gid-owner 3004 -j RETURN`，同时放行「服务端 IP/端口」与「代理自己的监听端口」，
-这样程序自己的出站连接不会被自己再抓一遍。
+1. **防回环机制**：
+   `cns-client` 以 GID 3004 运行，iptables 第一条规则就是 `-m owner --gid-owner 3004 -j RETURN`，同时放行「服务端 IP/端口」与「代理自己的监听端口」，确保程序自己的出站连接不会被二次捕获。
+   程序内部严格按序：**先建好所有监听 socket，之后才 `setgid`**。
 
-程序内部的顺序是：**先建好所有监听 socket，之后才 `setgid`**。
-顺序反了会导致监听 socket 自身被 REDIRECT 抓住，直接死循环。
+2. **DNS 53 直连放行铁律**：
+   分流规则中将 UDP/TCP 53 端口明确打上 `-j RETURN` 放行，**不进入免流隧道**。这一设计避免了 Android `rp_filter`（反向路径过滤）源地址错乱丢包，并彻底消除了 DNS 走隧道查上游带来的解析延迟，网页加载首包秒开。
 
 ## 已知取舍与联动关系
 

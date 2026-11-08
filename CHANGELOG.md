@@ -4,20 +4,20 @@
 
 ## 0.3.2
 
-### 新增与修复
+### 架构演进与优化
 
-- **TPROXY 模式全量支持 IPv6 原生透明代理与策略路由**（`cns_rules.sh`）：
-  - **环境与路径修复**：在调度脚本头部注入 `export PATH="/system/bin:/system/xbin:$PATH"`，确保在 Termux 或精简 shell 下正确调用系统的 `/system/bin/ip6tables` 与 `ip`。
-  - **纠正内核能力判定**：澄清早期"无法实现 IPv6"的误解——Android 内核虽无 `ip6table_nat`（无法做 REDIRECT），但完整具备 `ip6table_mangle` 以及 `xt_TPROXY` target。修复脚本中写死 `HAS_V6="$HAS_V6_NAT"` 的 Bug，改为依据模式动态匹配；在 `tproxy_mode=tproxy` 下完整启用 `ip -6 rule`、`ip -6 route` 以及 `ip6tables` mangle 规则链。
-  - **底层协议保活**：TPROXY 规则链放行 DHCPv6 端口（546:547）及 ICMPv6 邻居发现协议（NDP），避免移动网络断流或路由通告失败。
-  - **动态促退**：仅在 REDIRECT 模式或配置明确指定 `block_ipv6=true` 时挂载 `CNS_V6_OUT` 阻断链；在 TPROXY 模式且开启 IPv6 时自动卸载阻断链，允许 IPv6 流量原生直进隧道。
+- **全面收敛为 Android 原生 REDIRECT 架构，彻底移除 TPROXY 模式**（`cns_rules.sh`）：
+  - **移除原因与权衡**：TPROXY 体系在 Android 本机出站场景下极为脆弱（本机应用打 mark 经策略路由回环到 lo，极易与 Android Netd 的 fwmark 发生位冲突；服务端回包进 PREROUTING 容易误入劫持形成三次握手死锁，导致 HTTP/HTTPS 全网断流）。决定彻底精简剔除 TPROXY 策略路由与 mangle 链注入逻辑。
+  - **统一专注稳定**：规则调度全面收敛至 Linux/Android 内核开箱即用且高度稳定的 NAT REDIRECT 模式，并在 `stop_rules` 中增加对历史残留 TPROXY 策略路由与 mangle 规则的彻底清理，保证纯净与幂等。
 - **DNS 53 端口直连放行**（`cns_rules.sh`）：
-  - 在 TPROXY 和 REDIRECT 规则链中将 UDP/TCP 53 端口明确标记为 `RETURN` 直连放行，不再强行劫持进本地 DNS 中继或隧道。
-  - 彻底避免 Android `rp_filter`（反向路径过滤）源地址错乱丢包，消除 DNS 经隧道查询导致的链路延迟，网页加载首包秒开。
-- **流量首包协议嗅探（SNI / HTTP Host）**（`crates/cns-core/src/sniff.rs`）：
-  - 新增纯 Rust 零依赖首包嗅探模块，从入站 TCP 原始切片中提取 TLS ClientHello SNI 或 HTTP Host 域名，解决 REDIRECT / 共享 IP 节点下域名丢失导致的握手失败。
-- **数据传输双向优雅半关闭优化**（`crates/cns-core/src/transport/pump.rs`）：
-  - 引入双向 watch channel 宣告与 15 秒 `idle_grace` 静默缓冲期，一端宣告关闭后允许对端正常把在途应答接收完毕，杜绝过早暴力断连。
+  - 在分流规则中将 UDP/TCP 53 端口明确标记为 `RETURN` 直连放行，不走隧道，彻底解决 Android `rp_filter`（反向路径过滤）源地址错乱丢包，消除 DNS 经隧道查询导致的延迟，网页首包秒开。
+- **IPv6 0ms 快速促退（REJECT）机制**（`cns_rules.sh`）：
+  - 由于 Android 内核通常未编译 `ip6table_nat`（无法做 IPv6 REDIRECT），为防止双栈 App 的 IPv6 优先解析落入黑洞，通过 `CNS_V6_OUT` 链以 0ms TCP RST 与 ICMPv6 port-unreachable 快速拒绝，配合客户端 Happy Eyeballs 机制瞬间秒级回退至 IPv4 免流隧道。
+- **IPv6 服务端连接增强**（`crates/cns-core/src/transport/listener.rs`）：
+  - 在 `connect_any_mss` 中接入 `normalize_socket_str`，即使配置中填写未加方括号的 IPv6 地址加端口（如 `2a10::1b4:13872`）也能正确解析并稳定建立连接。
+- **模块脚本健壮性**（`cns_rules.sh`）：
+  - 修复 Android toybox `sed` 在基础正则下无法解析 `\(true\|false\)` 导致 `json_get_bool` 误判的 Bug（改用 `sed -E -n`）。
+  - 在调度脚本头部注入 `export PATH="/system/bin:/system/xbin:/sbin:$PATH"`，确保在 Termux 或精简 shell 下正确调用系统网络工具。
 
 ## 0.3.1
 

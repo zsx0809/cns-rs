@@ -20,7 +20,7 @@
 | :--- | :--- | :--- | :--- |
 | 运行模型 | Go GC + 每连接 goroutine | Tokio 单线程调度、无 GC 抖动 | 语言层事实 |
 | 转发热路径 | 每包一次日志/拷贝 | 原位异或 + 32KB 缓冲池复用（`BufferPool`） | `cns-core::transport::pump` |
-| 代理入口 | TUN 虚拟网卡（用户态拷贝） | 支持 **REDIRECT 模式**（v4 内核 NAT）与 **TPROXY 模式**（v4/v6 原生透明代理 + 策略路由，DNS 53 直连放行） | 见「IPv6 支持与 TPROXY 模式」 |
+| 代理入口 | TUN 虚拟网卡（用户态拷贝） | **原生 REDIRECT 模式**（v4 内核 NAT 重定向，DNS 53 直连放行，IPv6 0ms 促退） | 见「分流与防回环机制」 |
 | DNS 隧道 | 每个查询新建一条 TCP 连接并完整握手 | **隧道复用 + 本地缓存**，一条连接跑并发查询 | `cns-client::outbound::mux` |
 | DNS 上游 | 由客户端随意指定 | 服务端配置为权威 + 客户端可选沿用 App 原始目标 | `dns_mode: orig\|fixed` |
 | 半关闭 | `try_join!`：单向 EOF 掐断另一向 | `join!` + 显式 `shutdown`，SSH/HTTPS banner 不丢 | `pump.rs` 有回归测试 |
@@ -299,19 +299,17 @@ iptables: No chain/target/match by that name.   # 内核没有 xt_TCPMSS
 * `--stats` 会打印 `mtu=1300 mss(v4=1260 v6=1240)` 与本机**最小可用接口 MTU**，
   部署者据此调 `tun_mtu`（可写 1280..1500，0 = 关闭钳制）。
 
-### 2. IPv6 支持与 TPROXY 模式（解开误解：真实内核原生支持）
+### 2. 分流设计：原生 REDIRECT、DNS 53 直连与 IPv6 0ms 促退
 
-> **关键认知澄清**：
-> 早期版本曾误认为"系统没有 ip6tables 且 mangle/TPROXY 全部不可用"。经深入排查发现：
-> 1. **命令路径**：Android 系统的绝对路径是 `/system/bin/ip6tables`（指向 iptables 的符号链接）。在 Termux 或精简 shell 下若 PATH 缺失 `/system/bin` 会导致命令找不到。脚本现已强行补全 `export PATH="/system/bin:/system/xbin:$PATH"`。
-> 2. **内核真实能力**：Android 内核确实**没有编译 `ip6table_nat`**，因此 IPv6 **确实无法使用 REDIRECT 模式**（REDIRECT 强依赖 nat 表）；但 Android 内核**完整支持 `ip6table_mangle` 以及 `xt_TPROXY` target**！
-> 3. **DNS 53 直连放行铁律**：无论 REDIRECT 还是 TPROXY 模式，**UDP/TCP 53 端口一律直连放行（RETURN），不进入免流隧道**。这一设计避免了 Android `rp_filter`（反向路径过滤）源地址错乱丢包，并彻底消除了 DNS 走隧道查上游带来的解析延迟，网页首包秒开。
+> **架构权衡与设计决策**：
+> 早期曾尝试在 Android 上通过 TPROXY 策略路由接管本机出站。实测发现：Android 本机 App 出站经过策略路由（打 mark reroute 到 lo）会与 Android 系统 Netd 服务的 fwmark 产生严重冲突，且回包容易被误拦截导致 TCP 握手卡死（全网断流）。因此，`cns-rs` 全面收敛并专注于成熟可靠的 **NAT REDIRECT** 架构。
 
-在 `tproxy_mode: "tproxy"` 且 `block_ipv6: false` 下：
-* **入站 PREROUTING**：IPv4 与 IPv6 流量分别经由 `iptables` / `ip6tables` mangle 链打上 TPROXY 标签推向本地透明代理监听端口（`0.0.0.0:7750` 与 `[::]:7750`）。
-* **出站 OUTPUT**：本机 App 的出站 TCP/UDP 流量打上 `0x1/0x1` mark，配合策略路由 `ip -6 rule add fwmark 0x1/0x1 lookup 100` 与 `ip -6 route add local ::/0 dev lo table 100` 拦截。
-* **协议保活**：放行 DHCPv6（546:547 端口）与 ICMPv6 邻居发现协议（NDP），保证移动网络与路由通告完全正常。
-* **按需促退**：仅在 REDIRECT 模式或配置开启 `block_ipv6: true` 时才启用 `CNS_V6_OUT` 链快速促退（REJECT）IPv6，保证双栈 App 零等待回退 IPv4；在 TPROXY 模式下全量放行 IPv6 代理！
+* **DNS 53 端口直连放行（铁律）**：
+  分流规则中将 UDP/TCP 53 端口打上 `-j RETURN` 直连放行，**不进入免流隧道**。彻底避免 Android `rp_filter`（反向路径过滤）源地址错乱丢包，并消除 DNS 经隧道查询带来的多余往返延迟，网页加载首包秒开。
+* **IPv6 0ms 快速促退（REJECT）**：
+  Android 内核普遍未编译 `ip6table_nat` 表（原生不支持 IPv6 REDIRECT）。为了防止双栈 App 因 IPv6 解析快于 IPv4 而直接走直连甚至进入网络黑洞，通过 `CNS_V6_OUT` 链以 0ms TCP RST / ICMPv6 快速拒绝，促使客户端触发 RFC 6555/8305 (Happy Eyeballs) 机制瞬间无缝回退到 IPv4 TCP 走免流隧道。
+* **服务端 IPv6 支持**：
+  客户端自身支持直接连接纯 IPv6 VPS 节点（如 `2a10::1b4:13872`），并原生完成双栈并发测速。
 
 ### 效果（同一台机器实测）
 

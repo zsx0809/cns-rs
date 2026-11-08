@@ -1,26 +1,15 @@
 #!/system/bin/sh
 # cns-rs 透明代理调度脚本
 #
-# 关键修复（相对 v0.1.x）：
-#   1. 服务端端口不再硬编码 13872 —— 从 modes/<模式>.json 里读，避免
-#      「放行端口与实际端口不符 -> cns-client 自己的出站被 REDIRECT 抓回自己」的回环死锁。
-#   2. 所有 add 规则先做存在性检查（-C），重复 start 不再堆积规则。
-#   3. stop 用「整表删除 + 链回收」并幂等，异常中断后也能干净复原。
-#   4. DNS 拦截端口取自配置，而不是与 config.ini 脱节的第二个数字。
-#   5. 支持 redirect / tproxy 两种劫持方式，并按内核能力自动降级。
-#
-# v0.3.1 追加：
-#   6. 启动前一致性自检 preflight_check()：
-#      modes/<模式>.json 与 config.ini（以及实际传给 cns-client 的 -t / --mode /
-#      --dns-listen / -g）必须一致。不一致时**中止启动**并打印「改哪个文件的哪个字段」，
-#      而不是静默生成自相矛盾的规则（那种情况的表现是全断网且 client.log 无任何报错）。
-#      自检在 stop_rules 之前执行：配置写错时不会先把一个正在工作的会话拆掉。
-#   7. QUIC 拦截策略与 block_ipv6 联动：
-#      blockQuic=1 且模式 JSON 的 block_ipv6=true 时用 -j DROP（软失败，促 App 按
-#      「网络慢」回退 TCP），否则维持 REJECT；stop 路径把 DROP / REJECT 两种形态全清。
-#   8. IPv6 能力分开探测：本机实测 ip6tables **没有 nat 表**，v6 无法做 REDIRECT；
-#      但 TPROXY 走 mangle 表，v6 在 mangle/TPROXY 上完全可用！
-#      因此按 tproxy_mode 动态绑定能力，TPROXY 模式下全量启用 IPv6 透明代理与策略路由。
+# 架构原则：
+#   1. 专一且稳定：统一采用 Linux/Android 内核最可靠的原生 REDIRECT (NAT 重定向) 模式。
+#      彻底移除繁杂脆弱易死锁的 TPROXY 策略路由体系。
+#   2. DNS 53 端口直连放行（RETURN）：彻底避免 Android rp_filter 丢包，消除 DNS 经隧道查询的延迟，网页秒开。
+#   3. 服务端端口动态放行，从 modes/<模式>.json 提取，避免抓回回环死锁。
+#   4. 所有 add 规则先做存在性检查（-C），重复 start 不堆积规则。
+#   5. stop 幂等整表清理，异常中断也能彻底复原（包含历史残留清理）。
+#   6. 启动前一致性自检 preflight_check()。
+#   7. IPv6 0ms 快速促退（REJECT），配合 Happy Eyeballs 秒退 IPv4 走免流隧道，彻底避免 v6 黑洞。
 
 export PATH="/system/bin:/system/xbin:/sbin:/data/data/com.termux/files/usr/bin:$PATH"
 
@@ -37,11 +26,9 @@ modeName="${modeName:-联通}"
 TPORT_OVERRIDE="${tproxy_port:-}"
 allowWifi="${allowWifi:-1}"
 allowApps="${allowApps:-}"
-# 劫持方式：留空 = 以 modes/<模式>.json 的 tproxy_mode 为准（推荐）；
-#           填写则**必须与 JSON 里的值相同**，不一致会在 preflight_check 报错中止。
-tproxy_mode="${tproxy_mode:-}"
+# 劫持模式固定为 redirect（Android 内核原生支持最稳）
+tproxy_mode="redirect"
 # 是否拦截 QUIC（UDP 443）：1=拦截（促使回退 TCP TLS），0=放行
-# 拦截形态由 quic_policy() 决定：block_ipv6=true 时为 DROP，否则 REJECT。
 blockQuic="${blockQuic:-1}"
 # 是否放行本机 DNS（有些 ROM 的 netd 走 127.0.0.1:53，被劫持会解析全挂）
 protectLocalDns="${protectLocalDns:-1}"
@@ -76,10 +63,8 @@ port_of() {
 }
 
 # ---------- 内核能力探测 ----------
-# 注意：Android 内核的 ip6tables 通常没有 nat 表（ip6table_nat 模块常未编译），所以
-#   · REDIRECT（nat）模式下 v6 无法劫持 -> HAS_V6_NAT=0；
-#   · TPROXY 走 mangle 表，Android 内核的 ip6table_mangle 与 xt_TPROXY 是完全可用的（HAS_V6_MANGLE=1）；
-#   · QUIC 拦截落在 filter 表，与 nat 无关 -> 用 HAS_V6_FILTER 判断。
+# Android 内核通常没有 ip6table_nat 表，
+# 因此 REDIRECT 模式走 IPv4 nat 表劫持，IPv6 流量走 filter 表快速促退回退 IPv4。
 probe_v6() {
     HAS_V6_NAT=0; HAS_V6_MANGLE=0; HAS_V6_FILTER=0
     ip6tables -w -t nat -L    >/dev/null 2>&1 && HAS_V6_NAT=1
@@ -90,19 +75,11 @@ probe_v6() {
 # ---------- iptables 封装 ----------
 setup_tools() {
     probe_v6
-    # 模式感知决策：
-    #   · TPROXY 模式走 mangle 表，只要 mangle 可用（HAS_V6_MANGLE=1），v6 就完全可用！
-    #   · REDIRECT 模式走 nat 表，必须依赖 HAS_V6_NAT=1。
-    if [ "$tproxy_mode" = "tproxy" ]; then
-        HAS_V6="$HAS_V6_MANGLE"
-    else
-        HAS_V6="$HAS_V6_NAT"
-    fi
+    # REDIRECT 模式使用 nat 表
     TOOLS="iptables"
-    [ "$HAS_V6" = "1" ] && TOOLS="iptables ip6tables"
+    [ "$HAS_V6_NAT" = "1" ] && TOOLS="iptables ip6tables"
 
-    # stop 路径的工具集合：比 $TOOLS 更宽。
-    # 换过模式 / 换过配置之后，上一条命留下的 v6 规则也必须能被清掉（否则残留断网）。
+    # stop 路径清理工具集：必须包含 ip6tables 以彻底清理促退规则与历史残留
     TOOLS_CLEAN="iptables"
     if [ "$HAS_V6_NAT" = "1" ] || [ "$HAS_V6_MANGLE" = "1" ] || [ "$HAS_V6_FILTER" = "1" ]; then
         TOOLS_CLEAN="iptables ip6tables"
@@ -234,47 +211,8 @@ quic_policy() {
 preflight_check() {
     _bad=0
 
-    # ---- 1) 劫持方式 tproxy_mode：config.ini（脚本用它生成 iptables、并用 --mode 传给客户端）
-    #         必须与 modes/<模式>.json 的 tproxy_mode 相同 ----
-    _jm=$(json_get "$CONF" tproxy_mode)
-    case "$_jm" in
-        redirect|tproxy|auto) : ;;
-        '')
-            _jm="auto"   # 客户端 ClientConfig::default_tproxy_mode() = "auto"
-            echo "⚠️  $CONF 未声明 tproxy_mode，客户端内置默认是 'auto'（先试 SO_ORIGINAL_DST 再试 local_addr）"
-            ;;
-        *)
-            echo "❌ $CONF 的 \"tproxy_mode\": \"$_jm\" 非法（只支持 redirect | tproxy | auto）"
-            echo "   → 修法：把 $CONF 的 tproxy_mode 改成 redirect 或 tproxy"
-            _bad=1
-            ;;
-    esac
-
-    # config.ini 没写 tproxy_mode 时，JSON 就是唯一真源，直接采用
-    if [ -z "$tproxy_mode" ]; then
-        case "$_jm" in
-            tproxy) tproxy_mode="tproxy" ;;
-            *)      tproxy_mode="redirect" ;;
-        esac
-        echo "ℹ️  config.ini 未指定 tproxy_mode，采用 $CONF 的 '$_jm' → iptables 按 '$tproxy_mode' 生成"
-    fi
-    [ "$_jm" = "auto" ] && \
-        echo "ℹ️  $CONF 为 auto，建议显式写成 \"tproxy_mode\": \"$tproxy_mode\"（当前 iptables 即按 $tproxy_mode 生成）"
-
-    # 两边都明确写了就必须相同（auto 能兼容两种规则，不算冲突）
-    case "$_jm" in
-        redirect|tproxy)
-            if [ "$_bad" = "0" ] && [ "$tproxy_mode" != "$_jm" ]; then
-                echo "❌ 劫持方式的两个真源冲突（会导致全断网且无任何报错）："
-                echo "     config.ini        : tproxy_mode='$tproxy_mode'  ← 脚本按它生成 iptables，并用 --mode 传给客户端"
-                echo "     $CONF : \"tproxy_mode\": \"$_jm\""
-                echo "   → 修法（二选一，改到两边相同为止）："
-                echo "       1) 把 $CONF 的 \"tproxy_mode\" 改成 \"$tproxy_mode\""
-                echo "       2) 或把 config.ini 的 tproxy_mode 改成 '$_jm'"
-                _bad=1
-            fi
-            ;;
-    esac
+    # ---- 1) 劫持方式：统一采用内核原生稳定的 REDIRECT 模式 ----
+    tproxy_mode="redirect"
 
     # ---- 2) 透明代理端口：脚本/规则实际用的 $tproxy_port vs JSON tproxy_listen ----
     _jlp=$(port_of "$(json_get "$CONF" tproxy_listen)")
@@ -414,173 +352,56 @@ start_rules() {
     echo "✓ cns-client 已就绪 (PID: $PID)"
 
     echo "⚙️ 注入分流规则..."
-    if [ "$tproxy_mode" = "tproxy" ]; then
-        echo "   模式: TPROXY (内核级透明代理 + 策略路由)"
-        # 1. 策略路由：将带有 0x1/0x1 标记的数据包重定向到本地 lo
-        command -v ip >/dev/null 2>&1 || { echo "⚠️  缺少 ip 命令，TPROXY 策略路由无法配置"; }
-        ip rule add fwmark 0x1/0x1 lookup 100 pref 100 2>/dev/null
-        ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
-        if [ "$HAS_V6" = "1" ]; then
-            ip -6 rule add fwmark 0x1/0x1 lookup 100 pref 100 2>/dev/null
-            ip -6 route add local ::/0 dev lo table 100 2>/dev/null
-        fi
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+    echo "   模式: REDIRECT (NAT 重定向)"
+    for tool in $TOOLS; do
+        $tool -w -t nat -N CNS_NAT 2>/dev/null
+        $tool -w -t nat -F CNS_NAT
 
-        for tool in $TOOLS; do
-            # 2. PREROUTING 链：捕获流量并交由本地 TPROXY Socket 处理
-            $tool -w -t mangle -N CNS_TP_PRE 2>/dev/null
-            $tool -w -t mangle -F CNS_TP_PRE
+        # 1. 防回环：本进程组 / 回环口
+        add "$tool" nat CNS_NAT -m owner --gid-owner "$GID_OWNER" -j RETURN
+        add "$tool" nat CNS_NAT -o lo -j RETURN
+        [ "$protectLocalDns" = "1" ] && add "$tool" nat CNS_NAT -d 127.0.0.0/8 -j RETURN
+        add "$tool" nat CNS_NAT -p udp --dport 67:68 -j RETURN
 
-            # 2.0 核心铁律：非 mark 流量（外网入站、服务端回包等）严禁进入 TPROXY，直接放行
-            # 只有本机应用在 OUTPUT 链被打上 0x1/0x1 标记并 reroute 到 lo 的出站流量才允许进入 TPROXY！
-            add "$tool" mangle CNS_TP_PRE -m mark ! --mark 0x1/0x1 -j RETURN
-
-            # 2.1 服务端回包放行（双重保险：源端口 sport 为服务端端口、源地址 s 为服务端 IP）
-            add "$tool" mangle CNS_TP_PRE -p tcp --sport "$SERVER_PORT" -j RETURN
-            for ip in $SERVER_IPS; do
-                case "$ip" in
-                    *:*) [ "$tool" = "ip6tables" ] && add "$tool" mangle CNS_TP_PRE -s "$ip" -p tcp -j RETURN ;;
-                    *)   [ "$tool" = "iptables" ]  && add "$tool" mangle CNS_TP_PRE -s "$ip" -p tcp -j RETURN ;;
-                esac
-            done
-
-            # 2.2 基础协议与放行端口（53 端口直连、DHCP、NDP、代理端口自身）
-            add "$tool" mangle CNS_TP_PRE -p udp --dport 53 -j RETURN
-            add "$tool" mangle CNS_TP_PRE -p tcp --dport 53 -j RETURN
-            if [ "$tool" = "iptables" ]; then
-                add "$tool" mangle CNS_TP_PRE -p udp --dport 67:68 -j RETURN
-            else
-                add "$tool" mangle CNS_TP_PRE -p udp --dport 546:547 -j RETURN
-                add "$tool" mangle CNS_TP_PRE -p ipv6-icmp -j RETURN
-            fi
-            add "$tool" mangle CNS_TP_PRE -p tcp --dport "$SERVER_PORT" -j RETURN
-            add "$tool" mangle CNS_TP_PRE -p tcp --dport "$tproxy_port" -j RETURN
-            add "$tool" mangle CNS_TP_PRE -p udp --dport "$DNS_PORT" -j RETURN
-            [ -n "$SOCKS_PORT" ] && add "$tool" mangle CNS_TP_PRE -p tcp --dport "$SOCKS_PORT" -j RETURN
-
-            # 2.3 TPROXY 规则注入 (严禁加 --on-ip，保留数据包真实目的 IP 与端口，避免篡改目的导致被当作自连回环掐断)
-            add "$tool" mangle CNS_TP_PRE -p tcp -j TPROXY --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
-            add "$tool" mangle CNS_TP_PRE -p udp -j TPROXY --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
-            add "$tool" mangle PREROUTING -j CNS_TP_PRE
-
-            # 3. OUTPUT 链：拦截本机应用出站流量并打 mark 重新路由至 lo
-            $tool -w -t mangle -N CNS_TP_OUT 2>/dev/null
-            $tool -w -t mangle -F CNS_TP_OUT
-
-            # 3.1 防回环：本进程组 / 回环网卡（非 mark 流量） / DNS 53 直连放行
-            add "$tool" mangle CNS_TP_OUT -m owner --gid-owner "$GID_OWNER" -j RETURN
-            add "$tool" mangle CNS_TP_OUT -p udp --dport 53 -j RETURN
-            add "$tool" mangle CNS_TP_OUT -p tcp --dport 53 -j RETURN
-            add "$tool" mangle CNS_TP_OUT -o lo -m mark ! --mark 0x1/0x1 -j RETURN
-            if [ "$tool" = "iptables" ]; then
-                add "$tool" mangle CNS_TP_OUT -p udp --dport 67:68 -j RETURN
-            else
-                add "$tool" mangle CNS_TP_OUT -p udp --dport 546:547 -j RETURN
-                add "$tool" mangle CNS_TP_OUT -p ipv6-icmp -j RETURN
-            fi
-
-            # 3.2 CNS 服务端 IP/端口放行
-            add "$tool" mangle CNS_TP_OUT -p tcp --dport "$SERVER_PORT" -j RETURN
-            for ip in $SERVER_IPS; do
-                case "$ip" in
-                    *:*) [ "$tool" = "ip6tables" ] && add "$tool" mangle CNS_TP_OUT -d "$ip" -p tcp -j RETURN ;;
-                    *)   [ "$tool" = "iptables" ]  && add "$tool" mangle CNS_TP_OUT -d "$ip" -p tcp -j RETURN ;;
-                esac
-            done
-
-            # 3.3 代理自身监听端口放行
-            add "$tool" mangle CNS_TP_OUT -p tcp --dport "$tproxy_port" -j RETURN
-            add "$tool" mangle CNS_TP_OUT -p udp --dport "$DNS_PORT" -j RETURN
-            [ -n "$SOCKS_PORT" ] && add "$tool" mangle CNS_TP_OUT -p tcp --dport "$SOCKS_PORT" -j RETURN
-
-            # 3.4 私网与保留地址直连（避免路由器管理页与局域网设备无法访问）
-            if [ "$tool" = "iptables" ]; then
-                for rip in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-                    add iptables mangle CNS_TP_OUT -d "$rip" -j RETURN
-                done
-            else
-                for rip in ::1/128 fe80::/10 fc00::/7 ff00::/8; do
-                    add ip6tables mangle CNS_TP_OUT -d "$rip" -j RETURN
-                done
-            fi
-
-            # 3.5 WiFi 放行
-            [ "$allowWifi" = "1" ] && add "$tool" mangle CNS_TP_OUT -o wlan+ -j RETURN
-            [ "$allowWifi" = "1" ] && add "$tool" mangle CNS_TP_OUT -o p2p+ -j RETURN
-            [ "$allowWifi" = "1" ] && add "$tool" mangle CNS_TP_OUT -o ap+ -j RETURN
-
-            # 3.6 放行指定 App
-            for app in $allowApps; do
-                [ -z "$app" ] && continue
-                case "$app" in
-                    *[!0-9]*)
-                        uid=$(cmd package list packages -U 2>/dev/null | grep -F "$app" | grep -oE 'uid: [0-9]+' | awk '{print $2}' | head -n 1)
-                        [ -n "$uid" ] && add "$tool" mangle CNS_TP_OUT -m owner --uid-owner "$uid" -j RETURN
-                        ;;
-                    *)
-                        add "$tool" mangle CNS_TP_OUT -m owner --uid-owner "$app" -j RETURN
-                        ;;
-                esac
-            done
-
-            # 3.7 打 mark 触发策略路由
-            add "$tool" mangle CNS_TP_OUT -p tcp -j MARK --set-xmark 0x1/0x1
-            add "$tool" mangle CNS_TP_OUT -p udp -j MARK --set-xmark 0x1/0x1
-            add "$tool" mangle OUTPUT -j CNS_TP_OUT
+        # 2. 放行 CNS 服务端本身
+        add "$tool" nat CNS_NAT -p tcp --dport "$SERVER_PORT" -j RETURN
+        for ip in $SERVER_IPS; do
+            case "$ip" in
+                *:*) [ "$tool" = "ip6tables" ] && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
+                *)   [ "$tool" = "iptables" ]  && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
+            esac
         done
-    else
-        echo "   模式: REDIRECT (NAT 重定向)"
-        for tool in $TOOLS; do
-            $tool -w -t nat -N CNS_NAT 2>/dev/null
-            $tool -w -t nat -F CNS_NAT
 
-            # 1. 防回环：本进程组 / 回环口
-            add "$tool" nat CNS_NAT -m owner --gid-owner "$GID_OWNER" -j RETURN
-            add "$tool" nat CNS_NAT -o lo -j RETURN
-            [ "$protectLocalDns" = "1" ] && add "$tool" nat CNS_NAT -d 127.0.0.0/8 -j RETURN
-            add "$tool" nat CNS_NAT -p udp --dport 67:68 -j RETURN
+        # 3. 放行代理自己的监听端口，避免自连
+        add "$tool" nat CNS_NAT -p tcp --dport "$tproxy_port" -j RETURN
+        add "$tool" nat CNS_NAT -p udp --dport "$DNS_PORT" -j RETURN
+        [ -n "$SOCKS_PORT" ] && add "$tool" nat CNS_NAT -p tcp --dport "$SOCKS_PORT" -j RETURN
 
-            # 2. 放行 CNS 服务端本身
-            add "$tool" nat CNS_NAT -p tcp --dport "$SERVER_PORT" -j RETURN
-            for ip in $SERVER_IPS; do
-                case "$ip" in
-                    *:*) [ "$tool" = "ip6tables" ] && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
-                    *)   [ "$tool" = "iptables" ]  && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
-                esac
-            done
+        # 4. WiFi 放行
+        [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o wlan+ -j RETURN
+        [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o p2p+ -j RETURN
+        [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o ap+ -j RETURN
 
-            # 3. 放行代理自己的监听端口，避免自连
-            add "$tool" nat CNS_NAT -p tcp --dport "$tproxy_port" -j RETURN
-            add "$tool" nat CNS_NAT -p udp --dport "$DNS_PORT" -j RETURN
-            [ -n "$SOCKS_PORT" ] && add "$tool" nat CNS_NAT -p tcp --dport "$SOCKS_PORT" -j RETURN
-
-            # 4. WiFi 放行
-            [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o wlan+ -j RETURN
-            [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o p2p+ -j RETURN
-            [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o ap+ -j RETURN
-
-            # 5. 放行指定 App
-            for app in $allowApps; do
-                [ -z "$app" ] && continue
-                case "$app" in
-                    *[!0-9]*)
-                        uid=$(cmd package list packages -U 2>/dev/null | grep -F "$app" | grep -oE 'uid: [0-9]+' | awk '{print $2}' | head -n 1)
-                        [ -n "$uid" ] && add "$tool" nat CNS_NAT -m owner --uid-owner "$uid" -j RETURN
-                        ;;
-                    *)
-                        add "$tool" nat CNS_NAT -m owner --uid-owner "$app" -j RETURN
-                        ;;
-                esac
-            done
-
-            # 6. DNS 53 直连放行（核心铁律：防 Android rp_filter 丢包与源地址错乱）与 TCP REDIRECT 拦截
-            add "$tool" nat CNS_NAT -p udp --dport 53 -j RETURN
-            add "$tool" nat CNS_NAT -p tcp --dport 53 -j RETURN
-            add "$tool" nat CNS_NAT -p tcp -j REDIRECT --to-ports "$tproxy_port"
-            add "$tool" nat OUTPUT -j CNS_NAT
+        # 5. 放行指定 App
+        for app in $allowApps; do
+            [ -z "$app" ] && continue
+            case "$app" in
+                *[!0-9]*)
+                    uid=$(cmd package list packages -U 2>/dev/null | grep -F "$app" | grep -oE 'uid: [0-9]+' | awk '{print $2}' | head -n 1)
+                    [ -n "$uid" ] && add "$tool" nat CNS_NAT -m owner --uid-owner "$uid" -j RETURN
+                    ;;
+                *)
+                    add "$tool" nat CNS_NAT -m owner --uid-owner "$app" -j RETURN
+                    ;;
+            esac
         done
-    fi
+
+        # 6. DNS 53 直连放行（核心铁律：防 Android rp_filter 丢包与源地址错乱）与 TCP REDIRECT 拦截
+        add "$tool" nat CNS_NAT -p udp --dport 53 -j RETURN
+        add "$tool" nat CNS_NAT -p tcp --dport 53 -j RETURN
+        add "$tool" nat CNS_NAT -p tcp -j REDIRECT --to-ports "$tproxy_port"
+        add "$tool" nat OUTPUT -j CNS_NAT
+    done
 
     # 8. QUIC：拦截 UDP 443（必须用 REJECT 快速促退，严禁 DROP 导致浏览器卡死死等超时）
     _quic=$(quic_policy)
@@ -597,20 +418,9 @@ start_rules() {
             ;;
     esac
 
-    # 8.1 IPv6 促退拦截（仅在无法代理 IPv6 或配置显式阻断 IPv6 时启用）
-    # 规则：
-    #   - REDIRECT 模式下 v6 无法做 NAT 重定向，必须阻断促退回 IPv4；
-    #   - 或者模式配置显式 block_ipv6=true 时，必须阻断；
-    #   - 若为 TPROXY 模式且 block_ipv6=false 且 HAS_V6=1，则 IPv6 正常经 TPROXY 转发，绝不阻断！
-    _v6_block=0
-    _bi=$(json_get_bool "$CONF" block_ipv6)
-    [ -z "$_bi" ] && _bi="true"
-    if [ "$_bi" = "true" ] || [ "$tproxy_mode" != "tproxy" ] || [ "$HAS_V6" != "1" ]; then
-        _v6_block=1
-    fi
-
-    if [ "$_v6_block" = "1" ] && [ "$HAS_V6_FILTER" = "1" ]; then
-        echo "🚧 IPv6 促退阻断: 启用 (tproxy_mode=$tproxy_mode, block_ipv6=$_bi, HAS_V6=$HAS_V6)"
+    # 8.1 IPv6 快速促退（REDIRECT 模式走 IPv4 nat 表，v6 促退使双栈 App 瞬间回退 IPv4 TCP 走免流隧道）
+    if [ "$HAS_V6_FILTER" = "1" ]; then
+        echo "🚧 IPv6 快速促退: 启用 (0ms REJECT 促使双栈 App 瞬间回退 IPv4)"
         ip6tables -w -N CNS_V6_OUT 2>/dev/null || true
         ip6tables -w -F CNS_V6_OUT 2>/dev/null || true
         ip6tables -w -A CNS_V6_OUT -o lo -j RETURN
@@ -624,11 +434,6 @@ start_rules() {
         ip6tables -w -A CNS_V6_OUT -j REJECT --reject-with icmp6-port-unreachable
         del_all ip6tables filter OUTPUT -j CNS_V6_OUT
         add ip6tables filter OUTPUT -j CNS_V6_OUT
-    else
-        echo "🌐 IPv6 代理转发: 启用 (TPROXY 模式原生透明代理与策略路由)"
-        del_all ip6tables filter OUTPUT -j CNS_V6_OUT
-        ip6tables -w -F CNS_V6_OUT 2>/dev/null || true
-        ip6tables -w -X CNS_V6_OUT 2>/dev/null || true
     fi
 
     # 9. MSS 钳制，避免跨国链路大包分片丢包
@@ -791,14 +596,9 @@ run_tests() {
     echo "🎉 检测完毕。"
 }
 
-# status / test 用：只把 tproxy_mode 补全用于显示，不做任何校验、不生成规则
-# （start 路径由 preflight_check 负责严格校验并可能在必要时改写它）
+# status / test 用：模式固定为 redirect
 resolve_mode_soft() {
-    [ -n "$tproxy_mode" ] && return 0
-    case "$(json_get "$CONF" tproxy_mode)" in
-        tproxy) tproxy_mode="tproxy" ;;
-        *)      tproxy_mode="redirect" ;;
-    esac
+    tproxy_mode="redirect"
     return 0
 }
 
