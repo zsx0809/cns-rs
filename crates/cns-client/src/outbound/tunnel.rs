@@ -33,6 +33,29 @@ impl CnsClientTunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
+        Self::handle_tcp_proxy_with_prefill(
+            local_stream,
+            target_host,
+            config,
+            cipher,
+            pool,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// 与 CNS 服务端握手，注入客户端预读数据并建立双向代理泵。
+    pub async fn handle_tcp_proxy_with_prefill<S>(
+        local_stream: S,
+        target_host: String,
+        config: ClientConfig,
+        cipher: CuteBiCipher,
+        pool: BufferPool,
+        client_prefill: Vec<u8>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+    {
         // tun_mtu 非 0 时在 connect 之前钳 MSS —— MTU 黑洞（大文件传到固定字节数就卡死）
         // 的用户态解法，与 README 承诺的字段对齐；默认 0 = 保持原行为。
         let mut server_stream =
@@ -72,8 +95,7 @@ impl CnsClientTunnel {
             cipher,
             config.timeout(),
             &pool,
-            // 本地应用侧没有握手残余
-            Vec::new(),
+            client_prefill,
             // 服务端响应之后的粘包（密文，由 pump 按本方向游标解密）
             sticky.to_vec(),
         )

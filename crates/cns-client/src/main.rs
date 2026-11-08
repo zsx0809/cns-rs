@@ -576,14 +576,48 @@ async fn run_tproxy_listener(
                     match get_original_dst_with_mode(&stream, listen_port, mode) {
                         Ok(target_addr) => {
                             session_rt.stats.tproxy_tcp.fetch_add(1, Ordering::Relaxed);
-                            let target = target_addr.to_string();
+
+                            // 预读首包并嗅探真实域名（TLS SNI 或 HTTP Host），解决 CDN 节点漂移与多域名 IP 冲突
+                            let mut stream = stream;
+                            let peek_buf = match cns_core::sniff::read_peek_bounded(
+                                &mut stream,
+                                cns_core::sniff::PEEK_LIMIT,
+                                cns_core::sniff::PEEK_TIMEOUT,
+                            )
+                            .await
+                            {
+                                Ok(buf) => buf,
+                                Err(e) => {
+                                    debug!("peek read error from [{peer_addr}]: {e}");
+                                    return;
+                                }
+                            };
+
+                            let sniff_res = cns_core::sniff::Sniffer::sniff(&peek_buf);
+                            let target = match sniff_res {
+                                cns_core::sniff::SniffResult::Tls { sni } => {
+                                    format!("{}:{}", sni, target_addr.port())
+                                }
+                                cns_core::sniff::SniffResult::Http { host, .. } => {
+                                    if host.contains(':') {
+                                        host
+                                    } else {
+                                        format!("{}:{}", host, target_addr.port())
+                                    }
+                                }
+                                cns_core::sniff::SniffResult::Unknown => {
+                                    target_addr.to_string()
+                                }
+                            };
+
                             let logged = target.clone();
-                            if let Err(e) = CnsClientTunnel::handle_tcp_proxy(
+                            if let Err(e) = CnsClientTunnel::handle_tcp_proxy_with_prefill(
                                 stream,
                                 target,
                                 (*session_rt.config).clone(),
                                 (*session_rt.cipher).clone(),
                                 session_rt.pool,
+                                peek_buf,
                             )
                             .await
                             {

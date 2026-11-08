@@ -70,8 +70,11 @@ async fn pump_one<R, W>(
     writer: &mut W,
     cipher: &CuteBiCipher,
     idle: Duration,
+    idle_grace: Duration,
     buf: &mut [u8],
     prefill: &[u8],
+    peer_done: &mut tokio::sync::watch::Receiver<bool>,
+    tx_done: tokio::sync::watch::Sender<bool>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -90,22 +93,52 @@ where
             Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "prefill write timeout")),
         };
         if let Err(e) = r {
+            let _ = tx_done.send(true);
             let _ = timeout(Duration::from_secs(1), writer.shutdown()).await;
             return Err(e);
         }
     }
 
     loop {
-        let n = match timeout(idle, reader.read(buf)).await {
-            Ok(Ok(0)) => break, // EOF
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                result = Err(e);
-                break;
+        let is_peer_done = *peer_done.borrow_and_update();
+        let n = if is_peer_done {
+            // 对向已经结束：只允许再静默等待 idle_grace（如 15 秒）
+            match timeout(idle_grace, reader.read(buf)).await {
+                Ok(Ok(0)) => break, // 正常 EOF
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    result = Err(e);
+                    break;
+                }
+                Err(_) => {
+                    // 对向已关且本向超过静默期无新数据：视作正常收尾，不报错
+                    break;
+                }
             }
-            Err(_) => {
-                result = Err(io::Error::new(io::ErrorKind::TimedOut, "read idle timeout"));
-                break;
+        } else {
+            // 对向还在传输：等待读事件或对向结束信号
+            tokio::select! {
+                read_res = timeout(idle, reader.read(buf)) => {
+                    match read_res {
+                        Ok(Ok(0)) => break, // 正常 EOF
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => {
+                            result = Err(e);
+                            break;
+                        }
+                        Err(_) => {
+                            result = Err(io::Error::new(io::ErrorKind::TimedOut, "read idle timeout"));
+                            break;
+                        }
+                    }
+                }
+                changed = peer_done.changed() => {
+                    if changed.is_err() {
+                        // 对向 sender 已经 drop
+                        break;
+                    }
+                    continue;
+                }
             }
         };
 
@@ -126,7 +159,10 @@ where
         }
     }
 
-    // 半关闭：正常 EOF 与出错都要通知对向
+    // 宣告本方向已结束
+    let _ = tx_done.send(true);
+
+    // 半关闭：正常 EOF 与出错都要通知对向写端
     let _ = timeout(Duration::from_secs(1), writer.shutdown()).await;
     result
 }
@@ -176,8 +212,32 @@ where
     let mut buf_ab = pool.get();
     let mut buf_ba = pool.get();
 
-    let ab = pump_one(&mut a_read, &mut b_write, &cipher, idle, &mut buf_ab, &prefill_to_b);
-    let ba = pump_one(&mut b_read, &mut a_write, &cipher, idle, &mut buf_ba, &prefill_to_a);
+    let (tx_ab, mut rx_ab) = tokio::sync::watch::channel(false);
+    let (tx_ba, mut rx_ba) = tokio::sync::watch::channel(false);
+    let idle_grace = Duration::from_secs(15);
+
+    let ab = pump_one(
+        &mut a_read,
+        &mut b_write,
+        &cipher,
+        idle,
+        idle_grace,
+        &mut buf_ab,
+        &prefill_to_b,
+        &mut rx_ba,
+        tx_ab,
+    );
+    let ba = pump_one(
+        &mut b_read,
+        &mut a_write,
+        &cipher,
+        idle,
+        idle_grace,
+        &mut buf_ba,
+        &prefill_to_a,
+        &mut rx_ab,
+        tx_ba,
+    );
 
     // join! 而非 try_join!：一侧结束绝不能掐断另一侧
     let (r_ab, r_ba) = tokio::join!(ab, ba);

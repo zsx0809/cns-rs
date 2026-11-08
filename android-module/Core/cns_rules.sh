@@ -418,8 +418,10 @@ start_rules() {
             $tool -w -t mangle -N CNS_TP_PRE 2>/dev/null
             $tool -w -t mangle -F CNS_TP_PRE
 
-            # 2.1 放行自身 GID 与基础端口
+            # 2.1 放行自身 GID 与基础端口（53 端口直连放行，核心铁律：防丢包与源地址错乱）
             add "$tool" mangle CNS_TP_PRE -m owner --gid-owner "$GID_OWNER" -j RETURN 2>/dev/null || true
+            add "$tool" mangle CNS_TP_PRE -p udp --dport 53 -j RETURN
+            add "$tool" mangle CNS_TP_PRE -p tcp --dport 53 -j RETURN
             add "$tool" mangle CNS_TP_PRE -p udp --dport 67:68 -j RETURN
             add "$tool" mangle CNS_TP_PRE -p tcp --dport "$SERVER_PORT" -j RETURN
             add "$tool" mangle CNS_TP_PRE -p tcp --dport "$tproxy_port" -j RETURN
@@ -436,11 +438,9 @@ start_rules() {
 
             # 2.3 TPROXY 规则注入 (区分 IPv4 与 IPv6 的 --on-ip)
             if [ "$tool" = "iptables" ]; then
-                add iptables mangle CNS_TP_PRE -p udp --dport 53 -j TPROXY --on-ip 127.0.0.1 --on-port "$DNS_PORT" --tproxy-mark 0x1/0x1
                 add iptables mangle CNS_TP_PRE -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
                 add iptables mangle CNS_TP_PRE -p udp -j TPROXY --on-ip 127.0.0.1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
             else
-                add ip6tables mangle CNS_TP_PRE -p udp --dport 53 -j TPROXY --on-ip ::1 --on-port "$DNS_PORT" --tproxy-mark 0x1/0x1
                 add ip6tables mangle CNS_TP_PRE -p tcp -j TPROXY --on-ip ::1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
                 add ip6tables mangle CNS_TP_PRE -p udp -j TPROXY --on-ip ::1 --on-port "$tproxy_port" --tproxy-mark 0x1/0x1
             fi
@@ -450,8 +450,10 @@ start_rules() {
             $tool -w -t mangle -N CNS_TP_OUT 2>/dev/null
             $tool -w -t mangle -F CNS_TP_OUT
 
-            # 3.1 防回环：本进程组 / 回环网卡（非 mark 流量）
+            # 3.1 防回环：本进程组 / 回环网卡（非 mark 流量） / DNS 53 直连放行
             add "$tool" mangle CNS_TP_OUT -m owner --gid-owner "$GID_OWNER" -j RETURN
+            add "$tool" mangle CNS_TP_OUT -p udp --dport 53 -j RETURN
+            add "$tool" mangle CNS_TP_OUT -p tcp --dport 53 -j RETURN
             add "$tool" mangle CNS_TP_OUT -o lo -m mark ! --mark 0x1/0x1 -j RETURN
             add "$tool" mangle CNS_TP_OUT -p udp --dport 67:68 -j RETURN
 
@@ -549,32 +551,19 @@ start_rules() {
                 esac
             done
 
-            # 6. REDIRECT 拦截
-            add "$tool" nat CNS_NAT -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+            # 6. DNS 53 直连放行（核心铁律：防 Android rp_filter 丢包与源地址错乱）与 TCP REDIRECT 拦截
+            add "$tool" nat CNS_NAT -p udp --dport 53 -j RETURN
+            add "$tool" nat CNS_NAT -p tcp --dport 53 -j RETURN
             add "$tool" nat CNS_NAT -p tcp -j REDIRECT --to-ports "$tproxy_port"
             add "$tool" nat OUTPUT -j CNS_NAT
         done
     fi
 
-    # 8. QUIC：拦截 UDP 443，促使 App 秒级回退到 TCP TLS（不断流的关键之一）
-    #    形态由 quic_policy() 决定（B 项）：
-    #      blockQuic=1 且 block_ipv6=true -> DROP（软失败，App 按超时回退 TCP）
-    #      其余 -> REJECT --reject-with icmp-port-unreachable（原行为，快速失败）
-    #    v6 用 HAS_V6_FILTER 判断（filter 表可用性），与 nat 表无关：
-    #    本机 ip6tables 没有 nat 表，旧代码用 HAS_V6(=nat) 判断让这条 v6 规则成了死代码。
+    # 8. QUIC：拦截 UDP 443（必须用 REJECT 快速促退，严禁 DROP 导致浏览器卡死死等超时）
     _quic=$(quic_policy)
     case "$_quic" in
-        drop)
-            echo "🚧 QUIC 拦截: DROP（软失败，促 App 回退 TCP）—— blockQuic=1 且 block_ipv6 生效值为 true"
-            add iptables filter OUTPUT -p udp --dport 443 -j DROP
-            if [ "$HAS_V6_FILTER" = "1" ]; then
-                add ip6tables filter OUTPUT -p udp --dport 443 -j DROP
-            else
-                echo "   ⚠️  ip6tables filter 不可用，跳过 v6 的 UDP/443 拦截（v6 QUIC 直连）"
-            fi
-            ;;
-        reject)
-            echo "🚧 QUIC 拦截: REJECT --reject-with icmp-port-unreachable（block_ipv6 不为 true，保持原策略）"
+        drop|reject)
+            echo "🚧 QUIC 拦截: REJECT（快速促退，App 0.1ms 降级 TCP TLS）"
             add iptables filter OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
             if [ "$HAS_V6_FILTER" = "1" ]; then
                 add ip6tables filter OUTPUT -p udp --dport 443 -j REJECT
@@ -584,6 +573,23 @@ start_rules() {
             echo "🚧 QUIC 拦截: 关闭（blockQuic=$blockQuic，UDP/443 直连放行）"
             ;;
     esac
+
+    # 8.1 IPv6 全量促退（停机网关阻断 IPv6，0ms 促退使 Happy Eyeballs 瞬间回退 IPv4）
+    if [ "$HAS_V6_FILTER" = "1" ]; then
+        ip6tables -w -N CNS_V6_OUT 2>/dev/null || true
+        ip6tables -w -F CNS_V6_OUT 2>/dev/null || true
+        ip6tables -w -A CNS_V6_OUT -o lo -j RETURN
+        ip6tables -w -A CNS_V6_OUT -d fe80::/10 -j RETURN
+        for ip in $SERVER_IPS; do
+            case "$ip" in
+                *:*) ip6tables -w -A CNS_V6_OUT -d "$ip" -j RETURN ;;
+            esac
+        done
+        ip6tables -w -A CNS_V6_OUT -p tcp -j REJECT --reject-with tcp-reset
+        ip6tables -w -A CNS_V6_OUT -j REJECT --reject-with icmp6-port-unreachable
+        del_all ip6tables filter OUTPUT -j CNS_V6_OUT
+        add ip6tables filter OUTPUT -j CNS_V6_OUT
+    fi
 
     # 9. MSS 钳制，避免跨国链路大包分片丢包
     add iptables mangle POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
@@ -620,6 +626,11 @@ stop_rules() {
         del_all "$tool" filter OUTPUT -p udp --dport 443 -j DROP
         del_all "$tool" filter OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
         del_all "$tool" filter OUTPUT -p udp --dport 443 -j REJECT
+
+        # IPv6 促退链清理
+        del_all "$tool" filter OUTPUT -j CNS_V6_OUT
+        $tool -w -F CNS_V6_OUT 2>/dev/null || true
+        $tool -w -X CNS_V6_OUT 2>/dev/null || true
     done
     del_all iptables mangle POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
