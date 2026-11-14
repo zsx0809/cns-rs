@@ -18,8 +18,6 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Cargo Test
         run: cargo test --workspace
@@ -34,37 +32,35 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
-      - name: Install musl tools & cross toolchains
+      - name: Add Rust Targets
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu python3
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+          rustup target add aarch64-linux-android
+
+      - name: Install zig & cargo-zigbuild
+        run: |
+          pip install ziglang cargo-zigbuild
 
       - name: Build cns-server (x86_64-unknown-linux-musl)
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl -p cns-server
           mkdir -p dist
+          cargo zigbuild --release --target x86_64-unknown-linux-musl -p cns-server
           cp target/x86_64-unknown-linux-musl/release/cns-server dist/cns-server-x86_64
           strip dist/cns-server-x86_64
 
       - name: Build cns-server (aarch64-unknown-linux-musl)
         run: |
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-          CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
-          cargo build --release --target aarch64-unknown-linux-musl -p cns-server
+          cargo zigbuild --release --target aarch64-unknown-linux-musl -p cns-server
           cp target/aarch64-unknown-linux-musl/release/cns-server dist/cns-server-aarch64
-          aarch64-linux-gnu-strip dist/cns-server-aarch64
+          strip dist/cns-server-aarch64
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
           add-to-path: true
-
-      - name: Add Android target
-        run: rustup target add aarch64-linux-android
 
       - name: Build cns-client (aarch64-linux-android)
         run: |
