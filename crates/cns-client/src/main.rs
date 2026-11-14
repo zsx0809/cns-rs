@@ -55,6 +55,18 @@ struct Args {
     #[arg(long)]
     dns_listen: Option<String>,
 
+    /// 覆盖服务端地址（如 163.177.17.189:443 或 10.0.0.200:80）
+    #[arg(short = 's', long = "server")]
+    server: Option<String>,
+
+    /// 覆盖出站模式：cns | cx | bd
+    #[arg(long = "outbound-mode")]
+    outbound_mode: Option<String>,
+
+    /// 覆盖百度专属白名单域名（如 wx.tenpay.com）
+    #[arg(long = "bd-whitelist")]
+    bd_whitelist: Option<String>,
+
     /// 不启动本地 DNS 中继（已由外部 dnsmasq/AdGuard 接管时使用）
     #[arg(long)]
     no_dns: bool,
@@ -97,13 +109,23 @@ async fn main() -> anyhow::Result<()> {
 
     // 关键修复：配置错误必须终止启动。旧实现回落到默认配置，而默认的
     // cns_server 是 127.0.0.1:1254、口令为空 —— 手机会对着自己疯狂失败并静默断网。
-    let config = match ClientConfig::from_file(&args.config) {
+    let mut config = match ClientConfig::from_file(&args.config) {
         Ok(cfg) => cfg,
         Err(e) => {
             error!("{e}");
             return Err(e);
         }
     };
+
+    if let Some(srv) = args.server {
+        config.cns_server = srv;
+    }
+    if let Some(m) = args.outbound_mode {
+        config.outbound_mode = m;
+    }
+    if let Some(bw) = args.bd_whitelist {
+        config.bd_whitelist = Some(bw);
+    }
 
     // 优先级：命令行 > 配置文件 > 内置默认。
     // 旧实现给 --dns-listen / --mode 写了 default_value，clap 永远返回「已给值」，

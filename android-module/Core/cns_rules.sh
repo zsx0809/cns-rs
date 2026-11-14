@@ -23,6 +23,8 @@ if [ -f "../config.ini" ]; then
 fi
 
 modeName="${modeName:-联通}"
+bd_ip="${bd_ip:-}"
+bd_whitelist="${bd_whitelist:-}"
 TPORT_OVERRIDE="${tproxy_port:-}"
 allowWifi="${allowWifi:-1}"
 allowApps="${allowApps:-}"
@@ -113,7 +115,14 @@ SERVER_HOST=""
 SERVER_PORT=""
 SERVER_IPS=""
 resolve_server() {
-    SERVER_ENDPOINT=$(json_get "$CONF" cns_server)
+    if [ "$modeName" = "BD" ] && [ -n "$bd_ip" ]; then
+        case "$bd_ip" in
+            *:*) SERVER_ENDPOINT="$bd_ip" ;;
+            *)   SERVER_ENDPOINT="${bd_ip}:443" ;;
+        esac
+    else
+        SERVER_ENDPOINT=$(json_get "$CONF" cns_server)
+    fi
     if [ -z "$SERVER_ENDPOINT" ]; then
         return 1
     fi
@@ -325,8 +334,24 @@ start_rules() {
     echo "🚀 启动 cns-client（TCP:$tproxy_port  DNS:$DNS_PORT  GID:$GID_OWNER  mode:$tproxy_mode）"
     echo "   服务端: $SERVER_HOST:$SERVER_PORT"
 
+    EXTRA_ARGS=""
+    if [ "$modeName" = "BD" ]; then
+        if [ -n "$bd_ip" ]; then
+            case "$bd_ip" in
+                *:*) _srv="$bd_ip" ;;
+                *)   _srv="${bd_ip}:443" ;;
+            esac
+            EXTRA_ARGS="$EXTRA_ARGS --server $_srv"
+        fi
+        if [ -n "$bd_whitelist" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --bd-whitelist $bd_whitelist"
+            echo "   百度白名单: $bd_whitelist"
+        fi
+    fi
+
     ./cns-client -c "$CONF" -g "$GID_OWNER" -t "$tproxy_port" \
         --mode "$tproxy_mode" --dns-listen "0.0.0.0:$DNS_PORT" \
+        $EXTRA_ARGS \
         -p client.pid >client.log 2>&1 &
 
     # 等待就绪（最多 5 秒），不靠固定 sleep

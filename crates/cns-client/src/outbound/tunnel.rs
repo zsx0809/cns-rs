@@ -61,13 +61,50 @@ impl CnsClientTunnel {
         let mut server_stream =
             connect_any_mss(&config.cns_server, config.enable_tfo, config.tun_mtu).await?;
 
-        // 混淆目标地址并组装 HTTP 伪装头
-        let encrypted_target =
-            if cipher.is_empty() { target_host.clone() } else { cipher.encrypt_host(&target_host) };
+        // 根据出站模式构造首包并确定 pump 的 cipher
+        let (handshake_bytes, effective_cipher, error_prefix) =
+            match config.outbound_mode.to_ascii_lowercase().as_str() {
+                "cx" => {
+                    // 电信 5G CTWAP 彩信免流：标准 RFC HTTP CONNECT
+                    let req = format!(
+                        "CONNECT {target_host} HTTP/1.1\r\n\
+                         Host: {target_host}\r\n\
+                         Proxy-Connection: Keep-Alive\r\n\r\n"
+                    );
+                    (req.into_bytes(), CuteBiCipher::empty(), "CTWAP proxy handshake failed")
+                }
+                "bd" => {
+                    // 联通百度直连免流：实测钉死专属穿透首包
+                    let whitelist = config.get_bd_whitelist();
+                    let req = format!(
+                        "CONNECT {target_host}@{whitelist}:443 HTTP/1.1\r\n\
+                         Host: 153.3.236.22:443\r\n\
+                         User-Agent: baiduboxapp\r\n\
+                         With-At: {whitelist}\r\n\
+                         X-T5-Auth: 683556433\r\n\
+                         Proxy-Connection: Keep-Alive\r\n\r\n"
+                    );
+                    (req.into_bytes(), CuteBiCipher::empty(), "Baidu proxy handshake rejected")
+                }
+                _ => {
+                    // 默认 CNS 私有协议自建隧道
+                    let encrypted_target = if cipher.is_empty() {
+                        target_host.clone()
+                    } else {
+                        cipher.encrypt_host(&target_host)
+                    };
+                    (
+                        config.render_fake_header(&encrypted_target),
+                        cipher,
+                        "CNS handshake failed",
+                    )
+                }
+            };
+
         // 必须带超时：`enable_tfo=true`（默认）时 TCP_FASTOPEN_CONNECT 让 connect()
         // 不产生 SYN，真正的建连发生在这一次 write 上。没有超时的话，一旦路由黑洞，
         // 单个会话会卡到内核超时（实测可达 ~127 s），期间一直占着并发 permit。
-        timeout(config.timeout(), server_stream.write_all(&config.render_fake_header(&encrypted_target)))
+        timeout(config.timeout(), server_stream.write_all(&handshake_bytes))
             .await
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "handshake write timed out")
@@ -84,7 +121,7 @@ impl CnsClientTunnel {
             let text = String::from_utf8_lossy(&head).to_string();
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
-                format!("CNS handshake failed: {}", text.trim()),
+                format!("{error_prefix}: {}", text.trim()),
             ));
         }
 
@@ -92,7 +129,7 @@ impl CnsClientTunnel {
         pump_bidirectional_with_prefill(
             local_stream,
             server_stream,
-            cipher,
+            effective_cipher,
             config.timeout(),
             &pool,
             client_prefill,
@@ -431,5 +468,91 @@ mod tests {
         drop(app);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), h).await;
         assert_eq!(seen.load(Ordering::Relaxed), 1, "obfuscated header wrong");
+    }
+
+    #[tokio::test]
+    async fn cx_mode_sends_standard_rfc_connect_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicU64::new(0));
+        let s = Arc::clone(&seen);
+
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut b = [0u8; 1024];
+            let n = sock.read(&mut b).await.unwrap_or(0);
+            let text = String::from_utf8_lossy(&b[..n]).to_string();
+            if text.starts_with("CONNECT 198.51.100.1:443 HTTP/1.1\r\n")
+                && text.contains("Host: 198.51.100.1:443\r\n")
+                && text.contains("Proxy-Connection: Keep-Alive\r\n")
+            {
+                s.store(1, Ordering::Relaxed);
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await;
+        });
+
+        let (app, local) = tokio::io::duplex(1024);
+        let mut cfg = config_for(proxy_addr);
+        cfg.outbound_mode = "cx".to_string();
+        let pool = BufferPool::new();
+        let h = tokio::spawn(CnsClientTunnel::handle_tcp_proxy(
+            local,
+            "198.51.100.1:443".to_string(),
+            cfg,
+            CuteBiCipher::empty(),
+            pool,
+        ));
+        drop(app);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), h).await;
+        assert_eq!(seen.load(Ordering::Relaxed), 1, "CX CONNECT handshake failed");
+    }
+
+    #[tokio::test]
+    async fn bd_mode_sends_baidu_connect_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicU64::new(0));
+        let s = Arc::clone(&seen);
+
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut b = [0u8; 1024];
+            let n = sock.read(&mut b).await.unwrap_or(0);
+            let text = String::from_utf8_lossy(&b[..n]).to_string();
+            if text.starts_with("CONNECT 198.51.100.2:443@mclient.alipay.com:443 HTTP/1.1\r\n")
+                && text.contains("Host: 153.3.236.22:443\r\n")
+                && text.contains("With-At: mclient.alipay.com\r\n")
+                && text.contains("X-T5-Auth: 683556433\r\n")
+                && text.contains("User-Agent: baiduboxapp\r\n")
+                && text.contains("Proxy-Connection: Keep-Alive\r\n")
+            {
+                s.store(1, Ordering::Relaxed);
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await;
+        });
+
+        let (app, local) = tokio::io::duplex(1024);
+        let mut cfg = config_for(proxy_addr);
+        cfg.outbound_mode = "bd".to_string();
+        cfg.bd_whitelist = Some("mclient.alipay.com".to_string());
+        let pool = BufferPool::new();
+        let h = tokio::spawn(CnsClientTunnel::handle_tcp_proxy(
+            local,
+            "198.51.100.2:443".to_string(),
+            cfg,
+            CuteBiCipher::empty(),
+            pool,
+        ));
+        drop(app);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), h).await;
+        assert_eq!(seen.load(Ordering::Relaxed), 1, "BD CONNECT handshake failed");
     }
 }

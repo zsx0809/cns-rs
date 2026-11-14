@@ -41,6 +41,14 @@ pub struct ClientConfig {
     #[serde(default = "default_header_host")]
     pub header_host: String,
 
+    /// 出站模式：`cns` (默认自建), `cx` (电信彩信), `bd` (百度直连)
+    #[serde(default = "default_outbound_mode", alias = "mode")]
+    pub outbound_mode: String,
+
+    /// 百度模式专属白名单域名（留空默认 wx.tenpay.com）
+    #[serde(default)]
+    pub bd_whitelist: Option<String>,
+
     #[serde(default)]
     pub custom_header: Option<String>,
 
@@ -122,6 +130,9 @@ fn default_udp_flag() -> String {
 fn default_header_host() -> String {
     "mclient.alipay.com".to_string()
 }
+fn default_outbound_mode() -> String {
+    "cns".to_string()
+}
 fn default_true() -> bool {
     true
 }
@@ -162,6 +173,8 @@ impl Default for ClientConfig {
             proxy_key: default_proxy_key(),
             udp_flag: default_udp_flag(),
             header_host: default_header_host(),
+            outbound_mode: default_outbound_mode(),
+            bd_whitelist: None,
             custom_header: None,
             enable_tfo: default_true(),
             timeout_seconds: default_timeout(),
@@ -236,6 +249,10 @@ impl ClientConfig {
             .map_err(|e| anyhow::anyhow!("invalid dns_listen '{}': {e}", self.dns_listen))?;
         if self.timeout_seconds == 0 {
             anyhow::bail!("timeout_seconds must be > 0");
+        }
+        match self.outbound_mode.to_ascii_lowercase().as_str() {
+            "cns" | "cx" | "bd" => {}
+            other => anyhow::bail!("outbound_mode must be \"cns\", \"cx\" or \"bd\", got \"{other}\""),
         }
         match self.dns_mode.as_str() {
             "orig" | "fixed" => {}
@@ -315,6 +332,17 @@ impl ClientConfig {
     /// 握手响应缓冲上限
     pub fn max_handshake_response(&self) -> usize {
         16 * 1024
+    }
+
+    /// 提取百度模式白名单（若配置多条逗号分隔，取首个有效域名；留空默认 wx.tenpay.com）
+    pub fn get_bd_whitelist(&self) -> &str {
+        if let Some(w) = self.bd_whitelist.as_deref() {
+            let trimmed = w.trim();
+            if !trimmed.is_empty() {
+                return trimmed.split(',').next().unwrap_or(trimmed).trim();
+            }
+        }
+        "wx.tenpay.com"
     }
 
     pub fn session_max_age(&self) -> Option<Duration> {
