@@ -95,8 +95,9 @@ impl Decoder for HttpUdpCodec {
                 frame_body.advance(10);
                 SocketAddr::new(IpAddr::V4(ip), port)
             }
-            3 => {
+            3 | 4 => {
                 // IPv6: [4 字节 flag] [16 字节 IP] [2 字节 Port] = 22 字节头
+                // 兼容：历史实现曾用 3，标准 SOCKS5 (RFC 1928) 与原版 clnc 使用 4 (ATYP_IPV6)
                 if frame_body.len() < 22 {
                     self.error_count += 1;
                     return Err(io::Error::new(
@@ -247,7 +248,7 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(UdpPacket { peer, payload: Bytes::from_static(b"hello") }, &mut buf).unwrap();
         // 帧体布局: [len_lo][len_hi][f0][f1=0][f2=0][addr_type][ip4][port2][payload]
-        buf[5] = 4; // 破坏保留标志位 f2
+        buf[4] = 1; // 破坏保留标志位 f2 (frame_body[2])
         assert!(codec.decode(&mut buf).is_err());
 
         let mut buf2 = BytesMut::new();
@@ -256,12 +257,28 @@ mod tests {
         assert!(codec.decode(&mut buf2).is_err());
 
         let mut buf3 = BytesMut::new();
-        // pkg_len=15 但 addr_type=3 需要 22 字节头 → 截断
+        // pkg_len=15 但 addr_type=4 需要 22 字节头 → 截断
         buf3.extend_from_slice(&[
-            15, 0, 0, 0, 0, 3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            15, 0, 0, 0, 0, 4, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
         ]);
         // 21 字节 < 2 + 15 = 17? 否，已收齐 → 应报截断错误
         assert!(codec.decode(&mut buf3).is_err());
+    }
+
+    #[test]
+    fn test_codec_ipv6_with_type_4_compatibility() {
+        let mut codec = HttpUdpCodec::new();
+        let peer: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let payload = Bytes::from_static(b"DNS QUERY VIA ATYP 4");
+
+        let mut buf = BytesMut::new();
+        codec.encode(UdpPacket { peer, payload: payload.clone() }, &mut buf).unwrap();
+
+        // 验证默认编码或手动修改 addr_type 为 4 (SOCKS5/clnc 格式) 均能正确解包
+        buf[5] = 4; // frame_body[3] = addr_type
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.peer, peer);
+        assert_eq!(decoded.payload, payload);
     }
 
     #[test]
