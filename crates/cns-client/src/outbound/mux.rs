@@ -224,6 +224,8 @@ impl MuxTunnel {
 
         static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
 
+        let driver_idle = config.timeout().max(Duration::from_secs(120));
+
         spawn_driver(
             stream,
             sticky.to_vec(),
@@ -233,7 +235,7 @@ impl MuxTunnel {
             req_rx,
             Arc::clone(&alive),
             Arc::clone(&failures),
-            config.timeout(),
+            driver_idle,
             udp_out,
         );
 
@@ -554,12 +556,12 @@ impl DnsChannel {
         Ok(t)
     }
 
-    /// 查询一次；隧道失效时重建一次再试（旧的「一次查询一条连接」变体保留为兜底）
+    /// 查询一次；隧道失效时重建再试（旧的「一次查询一条连接」变体保留为兜底）
     pub async fn query(&self, msg: &[u8]) -> io::Result<Vec<u8>> {
-        let wait = self.config.timeout();
+        let wait = self.config.timeout().min(Duration::from_secs(6)).max(Duration::from_secs(2));
         let mut last_err = io::Error::other("no attempt made");
 
-        for attempt in 0..2u8 {
+        for attempt in 0..3u8 {
             match self.ensure().await {
                 Ok(t) => match t.dns_query(msg, wait).await {
                     Ok(ans) => return Ok(ans),
@@ -582,7 +584,7 @@ impl DnsChannel {
                 Err(e) => {
                     warn!("dns tunnel open failed: {e}");
                     last_err = e;
-                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    tokio::time::sleep(Duration::from_millis(60)).await;
                 }
             }
         }

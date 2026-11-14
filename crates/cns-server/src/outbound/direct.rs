@@ -253,6 +253,8 @@ impl DirectOutbound {
                                         return Err(e);
                                     }
                                 }
+                                // 胜出连接注入 TCP 优化参数（TCP_NODELAY + KeepAlive + BBR）
+                                tune_tcp_stream(&stream);
                                 if policy.outbound_mss != 0 {
                                     tracing::debug!(
                                         "dial winner {addr} (attempt #{}) mss_target={} actual={:?}",
@@ -649,6 +651,20 @@ mod tests {
         };
         let (v4target, _h) = echo4().await;
         let blackhole: SocketAddr = "[2001:db8::cafe]:1".parse().unwrap();
+
+        // 探测宿主环境对该黑洞地址是否直接返回 RST（如某些容器/路由栈没有缺省路由会立刻拒绝），
+        // 若立刻拒绝则测不出错峰（退化为快速失败路径，由下个测试覆盖），必须显式跳过。
+        let probe = async {
+            if let Ok(s) = TcpSocket::new_v6() {
+                let _ = s.connect(blackhole).await;
+            }
+        };
+        let t_probe = std::time::Instant::now();
+        let _ = tokio::time::timeout(Duration::from_millis(100), probe).await;
+        if t_probe.elapsed() < Duration::from_millis(50) {
+            eprintln!("skip: host network rejects blackhole immediately (no silent drop environment)");
+            return;
+        }
         let p = DialPolicy::from_config(&Config {
             happy_eyeballs_ms: 300,
             dial_timeout: 5,

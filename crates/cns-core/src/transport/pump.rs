@@ -12,8 +12,9 @@
 
 use crate::crypto::CuteBiCipher;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
@@ -60,6 +61,38 @@ impl BufferPool {
     }
 }
 
+/// 双向传输活动跟踪器：记录最近一次双向任意一侧有数据流动的时刻。
+///
+/// 解决大模型深度思考/流式响应、半双工长轮询时单侧静默被误判为「读超时」的问题。
+/// 只有当双向在 `idle` 期间均无任何数据流动时才触发真正的超时。
+#[derive(Clone)]
+struct ActivityTracker {
+    start: Instant,
+    last_millis: Arc<AtomicU64>,
+}
+
+impl ActivityTracker {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_millis: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[inline]
+    fn touch(&self) {
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        self.last_millis.store(elapsed, Ordering::Release);
+    }
+
+    #[inline]
+    fn elapsed(&self) -> Duration {
+        let now = self.start.elapsed().as_millis() as u64;
+        let last = self.last_millis.load(Ordering::Acquire);
+        Duration::from_millis(now.saturating_sub(last))
+    }
+}
+
 /// 单向搬运：`read -> 原位异或 -> write`，全程保留密钥流游标（TCP 分包必需）。
 ///
 /// 结束（EOF 或错误）时 shutdown 自己的写端，让对端尽快感知半关闭。
@@ -75,6 +108,7 @@ async fn pump_one<R, W>(
     prefill: &[u8],
     peer_done: &mut tokio::sync::watch::Receiver<bool>,
     tx_done: tokio::sync::watch::Sender<bool>,
+    activity: &ActivityTracker,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -84,12 +118,16 @@ where
     let mut result = Ok(());
 
     if !prefill.is_empty() {
+        activity.touch();
         let mut chunk = prefill.to_vec();
         if !cipher.is_empty() {
             pass_sub = cipher.crypt_in_place(&mut chunk, pass_sub);
         }
         let r = match timeout(idle, writer.write_all(&chunk)).await {
-            Ok(r) => r,
+            Ok(r) => {
+                activity.touch();
+                r
+            }
             Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "prefill write timeout")),
         };
         if let Err(e) = r {
@@ -102,10 +140,13 @@ where
     loop {
         let is_peer_done = *peer_done.borrow_and_update();
         let n = if is_peer_done {
-            // 对向已经结束：只允许再静默等待 idle_grace（如 15 秒）
+            // 对向已经结束：只允许再静默等待 idle_grace（如 15~60 秒）
             match timeout(idle_grace, reader.read(buf)).await {
                 Ok(Ok(0)) => break, // 正常 EOF
-                Ok(Ok(n)) => n,
+                Ok(Ok(n)) => {
+                    activity.touch();
+                    n
+                }
                 Ok(Err(e)) => {
                     result = Err(e);
                     break;
@@ -116,29 +157,56 @@ where
                 }
             }
         } else {
-            // 对向还在传输：等待读事件或对向结束信号
-            tokio::select! {
-                read_res = timeout(idle, reader.read(buf)) => {
-                    match read_res {
-                        Ok(Ok(0)) => break, // 正常 EOF
-                        Ok(Ok(n)) => n,
-                        Ok(Err(e)) => {
-                            result = Err(e);
-                            break;
-                        }
-                        Err(_) => {
-                            result = Err(io::Error::new(io::ErrorKind::TimedOut, "read idle timeout"));
-                            break;
+            // 对向还在传输：
+            // 注意：单向可能长时间等待（如客户端发送完 Prompt 等待大模型生成思考）。
+            // 只要整条连接的双向活动在 idle 范围内，就不能单侧切断连接。
+            let poll_interval = idle.min(Duration::from_secs(5)).max(Duration::from_millis(50));
+            let mut read_bytes = None;
+            loop {
+                tokio::select! {
+                    read_res = timeout(poll_interval, reader.read(buf)) => {
+                        match read_res {
+                            Ok(Ok(0)) => {
+                                read_bytes = Some(Ok(0));
+                                break;
+                            }
+                            Ok(Ok(n)) => {
+                                activity.touch();
+                                read_bytes = Some(Ok(n));
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                read_bytes = Some(Err(e));
+                                break;
+                            }
+                            Err(_) => {
+                                if activity.elapsed() >= idle {
+                                    result = Err(io::Error::new(io::ErrorKind::TimedOut, "read idle timeout"));
+                                    read_bytes = Some(Err(io::Error::new(io::ErrorKind::TimedOut, "read idle timeout")));
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
-                changed = peer_done.changed() => {
-                    if changed.is_err() {
-                        // 对向 sender 已经 drop
+                    changed = peer_done.changed() => {
+                        if changed.is_err() {
+                            // 对向 sender 已经 drop
+                            break;
+                        }
+                        // 对向状态变化，跳出等待重新走顶层 is_peer_done
                         break;
                     }
-                    continue;
                 }
+            }
+
+            match read_bytes {
+                Some(Ok(0)) => break, // 正常 EOF
+                Some(Ok(n)) => n,
+                Some(Err(e)) => {
+                    result = Err(e);
+                    break;
+                }
+                None => continue,
             }
         };
 
@@ -147,7 +215,9 @@ where
         }
 
         match timeout(idle, writer.write_all(&buf[..n])).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                activity.touch();
+            }
             Ok(Err(e)) => {
                 result = Err(e);
                 break;
@@ -214,7 +284,8 @@ where
 
     let (tx_ab, mut rx_ab) = tokio::sync::watch::channel(false);
     let (tx_ba, mut rx_ba) = tokio::sync::watch::channel(false);
-    let idle_grace = Duration::from_secs(15);
+    let idle_grace = idle.min(Duration::from_secs(60));
+    let activity = ActivityTracker::new();
 
     let ab = pump_one(
         &mut a_read,
@@ -226,6 +297,7 @@ where
         &prefill_to_b,
         &mut rx_ba,
         tx_ab,
+        &activity,
     );
     let ba = pump_one(
         &mut b_read,
@@ -237,6 +309,7 @@ where
         &prefill_to_a,
         &mut rx_ab,
         tx_ba,
+        &activity,
     );
 
     // join! 而非 try_join!：一侧结束绝不能掐断另一侧
@@ -493,6 +566,41 @@ mod tests {
         .await
         .expect("must return on idle timeout");
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn half_duplex_long_thinking_wait_does_not_timeout() {
+        let (mut a_peer, a) = tokio::io::duplex(1024);
+        let (mut b_peer, b) = tokio::io::duplex(1024);
+        // 设置 idle 为 800ms
+        let h = tokio::spawn(pump_streams(a, b, CuteBiCipher::empty(), Duration::from_millis(800)));
+
+        // 1. A 发送 Prompt 请求
+        a_peer.write_all(b"prompt-request").await.unwrap();
+        let mut got_req = [0u8; 14];
+        b_peer.read_exact(&mut got_req).await.unwrap();
+        assert_eq!(&got_req, b"prompt-request");
+
+        // 2. A 停止发送，静默等待 B 深度思考 300ms（期间 A 没有任何数据发送）
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 3. B 开始回传第一个 token
+        b_peer.write_all(b"token-1").await.unwrap();
+        let mut got_tok1 = [0u8; 7];
+        a_peer.read_exact(&mut got_tok1).await.unwrap();
+        assert_eq!(&got_tok1, b"token-1");
+
+        // 4. B 继续流式下发，A 依然静默 300ms
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        b_peer.write_all(b"token-2").await.unwrap();
+        let mut got_tok2 = [0u8; 7];
+        a_peer.read_exact(&mut got_tok2).await.unwrap();
+        assert_eq!(&got_tok2, b"token-2");
+
+        drop(a_peer);
+        drop(b_peer);
+        let r = timeout(Duration::from_secs(2), h).await;
+        assert!(r.is_ok(), "session must finish gracefully");
     }
 
     #[test]

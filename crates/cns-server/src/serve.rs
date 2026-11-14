@@ -6,7 +6,7 @@
 
 use crate::config::{Config, DialPolicy};
 use crate::outbound::{DirectOutbound, Guard, Resolver, ResolverOptions};
-use crate::tunnel::{handle_dns_tcp_over_udp, handle_http_dns, pump_tcp_stream, UdpTunnel};
+use crate::tunnel::{handle_dns_tcp_over_udp, handle_http_dns, pump_tcp_stream_with_pool, UdpTunnel};
 use cns_core::crypto::CuteBiCipher;
 use cns_core::protocol::{HandshakeParser, SessionType, MAX_HANDSHAKE_BYTES};
 use cns_core::transport::{
@@ -65,6 +65,7 @@ pub struct ServerCtx {
     pub active: Arc<AtomicUsize>,
     pub sessions: Arc<AtomicU64>,
     pub shutdown: Arc<Notify>,
+    pub pool: cns_core::transport::BufferPool,
 }
 
 impl ServerCtx {
@@ -103,6 +104,7 @@ impl ServerCtx {
             config.default_target_port,
         ));
         let conn_sem = Arc::new(Semaphore::new(config.max_connections));
+        let pool = cns_core::transport::BufferPool::with_cap(config.max_connections.min(512).max(128));
         // guard 的 fakeip 段表由 policy 注入：任何一条回源路径都不可能漏掉这层守卫
         let guard = dial.apply_to(Guard::new(config.allow_private_targets));
         let config = Arc::new(config);
@@ -117,6 +119,7 @@ impl ServerCtx {
             active: Arc::new(AtomicUsize::new(0)),
             sessions: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(Notify::new()),
+            pool,
             config,
         })
     }
@@ -310,7 +313,7 @@ async fn dispatch(
             )
             .await
             .map_err(|_| anyhow::anyhow!("dial {target_host} timed out"))??;
-            pump_tcp_stream(stream, target, ctx.cipher.clone(), idle).await?;
+            pump_tcp_stream_with_pool(stream, target, ctx.cipher.clone(), idle, &ctx.pool).await?;
         }
         SessionType::Udp => {
             debug!("httpUDP tunnel [{peer_addr}]");

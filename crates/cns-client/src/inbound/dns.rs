@@ -221,8 +221,9 @@ impl LocalDnsRelay {
 
         // 4. 走复用隧道查询
         let channel = self.channel(upstream);
+        let query_timeout = self.config.timeout().min(Duration::from_secs(10)).max(Duration::from_secs(5));
         let answer =
-            timeout(self.config.timeout().min(Duration::from_secs(8)), channel.query(&query))
+            timeout(query_timeout, channel.query(&query))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tunnel dns query timed out"))?
                 .inspect_err(|_| {

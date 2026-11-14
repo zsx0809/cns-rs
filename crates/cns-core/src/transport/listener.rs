@@ -234,6 +234,29 @@ pub fn tune_tcp_stream(stream: &TcpStream) {
                 debug!("TCP_{name} unavailable: {}", io::Error::last_os_error());
             }
         }
+
+        // 尝试设置 BBR 拥塞控制算法（Linux 服务器加速）
+        let bbr = b"bbr\0";
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            bbr.as_ptr() as *const libc::c_void,
+            bbr.len() as libc::socklen_t,
+        );
+
+        // 尝试开启 TCP_QUICKACK 降低小包确认延迟
+        #[cfg(target_os = "linux")]
+        {
+            let quickack: libc::c_int = 1;
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &quickack as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&quickack) as libc::socklen_t,
+            );
+        }
     }
 }
 
