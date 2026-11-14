@@ -486,10 +486,35 @@ start_rules() {
     run_tests
 }
 
+# 针对 Android netd 破坏表（quota2/-m bpf 导致 -F/-X 失败）的自动修复
+sanitize_table() {
+    _proto="$1" # v4 | v6
+    _tbl="$2"   # 表名
+    case "$_proto" in
+        v4) _s=iptables-save;  _r=iptables-restore  ;;
+        v6) _s=ip6tables-save; _r=ip6tables-restore ;;
+        *) return 0 ;;
+    esac
+    if command -v "$_s" >/dev/null 2>&1 && command -v "$_r" >/dev/null 2>&1; then
+        _tmp="$DIR/.sanitize.$_proto.$_tbl"
+        "$_s" -t "$_tbl" 2>/dev/null | grep -vE 'quota2|-m bpf' > "$_tmp" 2>/dev/null || true
+        if [ -s "$_tmp" ]; then
+            "$_r" < "$_tmp" 2>/dev/null || true
+        fi
+        rm -f "$_tmp"
+    fi
+}
+
 stop_rules() {
-    echo "🛑 关闭免流模式..."
-    # 用 $TOOLS_CLEAN 而不是 $TOOLS：上一条命可能是 tproxy 模式（v6 走 mangle）
-    # 或 blockQuic 的另一形态，只清 $TOOLS 会留下清不掉的残留规则。
+    echo "🛑 关闭免流模式并还原网络..."
+
+    # 1. 修复 Android netd 特殊规则干扰
+    sanitize_table v4 nat
+    sanitize_table v4 filter
+    sanitize_table v4 mangle
+    sanitize_table v6 filter
+
+    # 2. 用 $TOOLS_CLEAN 深度清理所有分流规则
     for tool in $TOOLS_CLEAN; do
         del_all "$tool" nat OUTPUT -j CNS_NAT
         $tool -w -t nat -F CNS_NAT 2>/dev/null
@@ -507,19 +532,19 @@ stop_rules() {
         $tool -w -t mangle -F CNS_TP 2>/dev/null
         $tool -w -t mangle -X CNS_TP 2>/dev/null
 
-        # QUIC 拦截的两种形态都要清：block_ipv6 改动后形态会在 DROP / REJECT 之间切换，
-        # 只删一种就会把另一种留在表里（残留 REJECT/DROP 会一直掐着 UDP 443）。
+        # QUIC 拦截形态全量清理
         del_all "$tool" filter OUTPUT -p udp --dport 443 -j DROP
         del_all "$tool" filter OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
         del_all "$tool" filter OUTPUT -p udp --dport 443 -j REJECT
 
-        # IPv6 促退链清理
+        # IPv6 促退链全量清理
         del_all "$tool" filter OUTPUT -j CNS_V6_OUT
-        $tool -w -F CNS_V6_OUT 2>/dev/null || true
-        $tool -w -X CNS_V6_OUT 2>/dev/null || true
+        $tool -w -t filter -F CNS_V6_OUT 2>/dev/null || true
+        $tool -w -t filter -X CNS_V6_OUT 2>/dev/null || true
     done
-    del_all iptables mangle POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
+    # 3. MSS 钳制与路由表清理
+    del_all iptables mangle POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     if command -v ip >/dev/null 2>&1; then
         while ip rule del fwmark 0x1/0x1 lookup 100 pref 100 2>/dev/null; do :; done
         while ip rule del fwmark 0x1/0x1 lookup 100 2>/dev/null; do :; done
@@ -529,18 +554,24 @@ stop_rules() {
         ip -6 route del local ::/0 dev lo table 100 2>/dev/null
     fi
 
+    # 4. 彻底终止客户端进程（pid + 精确进程名双保险）
     PID=$(cat client.pid 2>/dev/null)
     if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
         kill "$PID" 2>/dev/null
-        # 等它自己收尾（半关闭 + 删除 pid 文件）
         i=0
-        while [ -d "/proc/$PID" ] && [ $i -lt 20 ]; do
+        while [ -d "/proc/$PID" ] && [ $i -lt 15 ]; do
             i=$((i + 1)); sleep 0.1
         done
         [ -d "/proc/$PID" ] && kill -9 "$PID" 2>/dev/null
     fi
+    pkill -9 -x cns-client 2>/dev/null || true
+    killall -9 cns-client 2>/dev/null || true
     rm -f client.pid
-    echo "✓ 规则已清理，网络恢复直连。"
+
+    echo "✓ 分流规则与后台进程已彻底还原，网络恢复系统直连。"
+    if [ "$modeName" = "CX" ]; then
+        echo "💡 提示：若使用了彩信模式 (CX)，请记得将手机 APN 切换回通用模式 (如 ctnet) 以恢复正常上网。"
+    fi
 }
 
 status_check() {
