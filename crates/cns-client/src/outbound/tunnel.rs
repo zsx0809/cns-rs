@@ -74,13 +74,13 @@ impl CnsClientTunnel {
                     (req.into_bytes(), CuteBiCipher::empty(), "CTWAP proxy handshake failed")
                 }
                 "bd" => {
-                    // 联通百度直连免流：实测钉死专属穿透首包（首行纯白名单防基站DPI劫持，真实目标走 With-At）
+                    // 联通百度直连免流：实测钉死专属穿透首包（首行 target@whitelist:443 穿透百度 Squid）
                     let whitelist = config.get_bd_whitelist();
                     let req = format!(
-                        "CONNECT {whitelist} HTTP/1.1\r\n\
-                         With-At: {target_host}\r\n\
+                        "CONNECT {target_host}@{whitelist}:443 HTTP/1.1\r\n\
                          Host: 153.3.236.22:443\r\n\
                          User-Agent: baiduboxapp\r\n\
+                         With-At: {whitelist}\r\n\
                          X-T5-Auth: 683556433\r\n\
                          Proxy-Connection: Keep-Alive\r\n\r\n"
                     );
@@ -525,9 +525,9 @@ mod tests {
             let mut b = [0u8; 1024];
             let n = sock.read(&mut b).await.unwrap_or(0);
             let text = String::from_utf8_lossy(&b[..n]).to_string();
-            if text.starts_with("CONNECT mclient.alipay.com HTTP/1.1\r\n")
-                && text.contains("With-At: 198.51.100.2:443\r\n")
+            if text.starts_with("CONNECT 198.51.100.2:443@mclient.alipay.com:443 HTTP/1.1\r\n")
                 && text.contains("Host: 153.3.236.22:443\r\n")
+                && text.contains("With-At: mclient.alipay.com\r\n")
                 && text.contains("X-T5-Auth: 683556433\r\n")
                 && text.contains("User-Agent: baiduboxapp\r\n")
                 && text.contains("Proxy-Connection: Keep-Alive\r\n")

@@ -556,8 +556,13 @@ impl DnsChannel {
         Ok(t)
     }
 
-    /// 查询一次；隧道失效时重建再试（旧的「一次查询一条连接」变体保留为兜底）
+    /// 查询一次；免 VPS 模式（cx/bd）直接原生 UDP 直连，自建 CNS 模式走 tcpDNS 复用隧道
     pub async fn query(&self, msg: &[u8]) -> io::Result<Vec<u8>> {
+        let mode = self.config.outbound_mode.to_ascii_lowercase();
+        if mode == "cx" || mode == "bd" {
+            return self.query_direct_udp(msg).await;
+        }
+
         let wait = self.config.timeout().min(Duration::from_secs(6)).max(Duration::from_secs(2));
         let mut last_err = io::Error::other("no attempt made");
 
@@ -589,6 +594,26 @@ impl DnsChannel {
             }
         }
         Err(last_err)
+    }
+
+    /// 免自建 VPS 模式（CX / BD）：对端为电信彩信网关或百度 Squid，无 tcpDNS 服务，直接用原生 UDP socket 向真实上游直连查询
+    async fn query_direct_udp(&self, msg: &[u8]) -> io::Result<Vec<u8>> {
+        let wait = self.config.timeout().min(Duration::from_secs(4)).max(Duration::from_secs(2));
+        let bind_addr = if self.upstream.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let sock = tokio::net::UdpSocket::bind(bind_addr).await?;
+        timeout(wait, async {
+            sock.send_to(msg, self.upstream).await?;
+            let mut buf = vec![0u8; 4096];
+            let (n, _from) = sock.recv_from(&mut buf).await?;
+            buf.truncate(n);
+            Ok(buf)
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct UDP dns query timed out"))?
     }
 }
 
