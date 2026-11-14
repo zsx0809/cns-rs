@@ -23,6 +23,10 @@ if [ -f "../config.ini" ]; then
 fi
 
 modeName="${modeName:-联通}"
+case "$modeName" in
+    cx|CX|Cx) modeName="CX" ;;
+    bd|BD|Bd) modeName="BD" ;;
+esac
 bd_ip="${bd_ip:-}"
 bd_whitelist="${bd_whitelist:-}"
 TPORT_OVERRIDE="${tproxy_port:-}"
@@ -115,11 +119,19 @@ SERVER_HOST=""
 SERVER_PORT=""
 SERVER_IPS=""
 resolve_server() {
-    if [ "$modeName" = "BD" ] && [ -n "$bd_ip" ]; then
-        case "$bd_ip" in
-            *:*) SERVER_ENDPOINT="$bd_ip" ;;
-            *)   SERVER_ENDPOINT="${bd_ip}:443" ;;
-        esac
+    if [ "$modeName" = "BD" ]; then
+        if [ -n "$bd_ip" ]; then
+            case "$bd_ip" in
+                *:*) SERVER_ENDPOINT="$bd_ip" ;;
+                *)   SERVER_ENDPOINT="${bd_ip}:443" ;;
+            esac
+        else
+            SERVER_ENDPOINT=$(json_get "$CONF" cns_server)
+            [ -z "$SERVER_ENDPOINT" ] && SERVER_ENDPOINT="163.177.17.189:443"
+        fi
+    elif [ "$modeName" = "CX" ]; then
+        SERVER_ENDPOINT=$(json_get "$CONF" cns_server)
+        [ -z "$SERVER_ENDPOINT" ] && SERVER_ENDPOINT="10.0.0.200:80"
     else
         SERVER_ENDPOINT=$(json_get "$CONF" cns_server)
     fi
@@ -268,6 +280,10 @@ preflight_check() {
         echo "❌ 无法从 $CONF 的 cns_server 解析出 主机:端口"
         echo "   → 修法：写成 \"cns_server\": \"你的服务端IP:1254\"（域名也支持）"
         _bad=1
+    elif [ "$modeName" = "CX" ]; then
+        echo "ℹ️  电信彩信直连模式 (免自建 VPS) → 放行 TCP $SERVER_PORT（$SERVER_HOST）"
+    elif [ "$modeName" = "BD" ]; then
+        echo "ℹ️  联通百度直连模式 (免自建 VPS) → 放行 TCP $SERVER_PORT（$SERVER_HOST）"
     else
         echo "ℹ️  服务端真源: $CONF cns_server=$SERVER_ENDPOINT → 放行 TCP $SERVER_PORT（$SERVER_HOST）"
     fi
@@ -594,9 +610,11 @@ run_tests() {
     C=$(probe2 "https://www.baidu.com" "https://www.google.com" 8)
     case "$C" in 200|301|302|403) echo "✓ $C";; skip) echo "skip (无 curl)";; *) echo "× ($C)";; esac
 
-    # 4. 服务端可达性：直连 CNS 端口（这条不通就说明放行规则或端口配错了）
+    # 4. 服务端可达性：直连 CNS 端口（免 VPS 模式跳过）
     printf "● [4/4] 服务端可达 ........ "
-    if [ -z "$CURL_BIN" ]; then
+    if [ "$modeName" = "CX" ] || [ "$modeName" = "BD" ]; then
+        echo "✓ (免 VPS 模式，直连运营商中继)"
+    elif [ -z "$CURL_BIN" ]; then
         echo "skip (无 curl)"
     elif [ -z "$SERVER_HOST" ] || [ -z "$SERVER_PORT" ]; then
         echo "× 未解析到服务端地址"

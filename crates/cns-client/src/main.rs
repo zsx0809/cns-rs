@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
         None => config.tproxy_mode_parsed(),
     };
 
-    if config.cns_password.is_empty() {
+    if config.outbound_mode.eq_ignore_ascii_case("cns") && config.cns_password.is_empty() {
         warn!("cns_password is EMPTY — traffic is unobfuscated. Set a password.");
     }
     // REDIRECT 会把目的地址改写成中继自己的地址，本地 DNS 中继因此拿不到 App 原本

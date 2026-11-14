@@ -216,12 +216,14 @@ impl ClientConfig {
             anyhow::bail!("cns_server must not be empty");
         }
         // 空 udp_flag 会让服务端 `header_str.contains("")` 恒真 —— 每个 TCP 会话都被
-        // 判成 httpUDP，等于全站断网。这类「配错一个字就静默瘫痪」的字段必须在启动期拒绝。
-        if self.udp_flag.is_empty() {
-            anyhow::bail!("udp_flag must not be empty");
-        }
-        if self.proxy_key.trim().is_empty() {
-            anyhow::bail!("proxy_key must not be empty");
+        // 判成 httpUDP。但彩信 (cx) 与百度 (bd) 模式无需自建 VPS 头，仅 cns 模式需要。
+        if self.outbound_mode.eq_ignore_ascii_case("cns") {
+            if self.udp_flag.is_empty() {
+                anyhow::bail!("udp_flag must not be empty in cns mode");
+            }
+            if self.proxy_key.trim().is_empty() {
+                anyhow::bail!("proxy_key must not be empty in cns mode");
+            }
         }
         // 伪装头是逐字节拼出来的，值里混进 CR/LF 会直接产出畸形请求
         for (name, value) in [
@@ -472,6 +474,28 @@ mod tests {
 
         // 默认配置本身必须自洽
         ClientConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn cx_and_bd_modes_can_have_empty_proxy_key_and_udp_flag() {
+        let cx_json = r#"{
+            "mode": "cx",
+            "cns_server": "10.0.0.200:80",
+            "proxy_key": "",
+            "udp_flag": ""
+        }"#;
+        let p = tmp_write("cx.json", cx_json);
+        assert!(ClientConfig::from_file(&p).is_ok());
+
+        let bd_json = r#"{
+            "mode": "bd",
+            "cns_server": "163.177.17.189:443",
+            "proxy_key": "",
+            "udp_flag": "",
+            "bd_whitelist": "wx.tenpay.com"
+        }"#;
+        let p2 = tmp_write("bd.json", bd_json);
+        assert!(ClientConfig::from_file(&p2).is_ok());
     }
 
     #[test]
