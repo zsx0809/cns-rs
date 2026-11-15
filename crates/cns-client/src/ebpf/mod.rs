@@ -108,6 +108,7 @@ impl EbpfManager {
         proxy_port: u16,
         proxy_gid: u32,
         server_port: u16,
+        proxy_pid: u32,
     ) -> io::Result<Self> {
         let elf = CNS_BPF_ELF;
         let cgroup_file = File::open(cgroup_path)?;
@@ -132,6 +133,10 @@ impl EbpfManager {
         let k_srv: u32 = 2;
         let v_srv: u32 = server_port as u32;
         Self::map_update(cfg_map_fd, &k_srv, &v_srv)?;
+
+        let k_pid: u32 = 3;
+        let v_pid: u32 = proxy_pid;
+        Self::map_update(cfg_map_fd, &k_pid, &v_pid)?;
 
         // 2. 解析 ELF、重定位并加载各程序
         let mut map_table = std::collections::HashMap::new();
@@ -234,7 +239,7 @@ impl EbpfManager {
         std::mem::forget(cgroup_file);
 
         info!(
-            "eBPF transparent proxy attached to {:?} (proxy_port={proxy_port}, gid={proxy_gid}, server_port={server_port})",
+            "eBPF transparent proxy attached to {:?} (proxy_port={proxy_port}, gid={proxy_gid}, server_port={server_port}, pid={proxy_pid})",
             cgroup_path
         );
 
@@ -275,14 +280,21 @@ impl EbpfManager {
             flags: 0,
         };
 
-        let ret = unsafe {
-            libc::syscall(
-                SYS_BPF,
-                BPF_MAP_LOOKUP_ELEM,
-                &attr as *const _ as *const libc::c_void,
-                std::mem::size_of::<BpfAttrMapOp>(),
-            )
-        };
+        let mut ret = -1;
+        for _ in 0..5 {
+            ret = unsafe {
+                libc::syscall(
+                    SYS_BPF,
+                    BPF_MAP_LOOKUP_ELEM,
+                    &attr as *const _ as *const libc::c_void,
+                    std::mem::size_of::<BpfAttrMapOp>(),
+                )
+            };
+            if ret == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         if ret != 0 {
             return Err(io::Error::last_os_error());

@@ -14,8 +14,9 @@
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *) 3;
-static __u64 (*bpf_get_socket_cookie)(void *ctx) = (void *) 46;
+static __u64 (*bpf_get_current_pid_tgid)(void) = (void *) 14;
 static __u64 (*bpf_get_current_uid_gid)(void) = (void *) 15;
+static __u64 (*bpf_get_socket_cookie)(void *ctx) = (void *) 46;
 
 #define bpf_htons(x) __builtin_bswap16(x)
 #define bpf_ntohs(x) __builtin_bswap16(x)
@@ -46,6 +47,7 @@ struct client_tuple_key {
 // key 0 -> proxy_port  (__u32)
 // key 1 -> proxy_gid   (__u32)
 // key 2 -> server_port (__u32)
+// key 3 -> proxy_pid   (__u32)
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 4);
@@ -95,7 +97,17 @@ int cns_connect4(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 5. 放行自身 GID 流量
+    // 5. 放行自身 PID (TGID) 进程流量（无视多线程 setgid 差异，100% 免疫回环）
+    __u32 k_pid = 3;
+    __u32 *ppid = bpf_map_lookup_elem(&cns_config_map, &k_pid);
+    if (ppid && *ppid != 0) {
+        __u32 cur_pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+        if (cur_pid == *ppid) {
+            return 1;
+        }
+    }
+
+    // 6. 放行自身 GID 流量（双重保险）
     __u32 k_gid = 1;
     __u32 *pgid = bpf_map_lookup_elem(&cns_config_map, &k_gid);
     __u32 cns_gid = pgid ? *pgid : 3004;
@@ -104,7 +116,7 @@ int cns_connect4(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 6. 记录原始目标地址
+    // 7. 记录原始目标地址
     __u64 cookie = bpf_get_socket_cookie(ctx);
     struct orig_dst_val dst = {};
     dst.family = 2; // AF_INET
@@ -112,7 +124,7 @@ int cns_connect4(struct bpf_sock_addr *ctx) {
     dst.ip4 = ctx->user_ip4;
     bpf_map_update_elem(&cookie_dst_map, &cookie, &dst, BPF_ANY);
 
-    // 7. 重定向至 127.0.0.1:proxy_port
+    // 8. 重定向至 127.0.0.1:proxy_port
     ctx->user_ip4 = 0x0100007f;
     ctx->user_port = bpf_htons(proxy_port);
     return 1;
@@ -144,7 +156,17 @@ int cns_connect6(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 5. 放行自身 GID 流量
+    // 5. 放行自身 PID (TGID) 进程流量（无视多线程 setgid 差异，100% 免疫回环）
+    __u32 k_pid = 3;
+    __u32 *ppid = bpf_map_lookup_elem(&cns_config_map, &k_pid);
+    if (ppid && *ppid != 0) {
+        __u32 cur_pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+        if (cur_pid == *ppid) {
+            return 1;
+        }
+    }
+
+    // 6. 放行自身 GID 流量（双重保险）
     __u32 k_gid = 1;
     __u32 *pgid = bpf_map_lookup_elem(&cns_config_map, &k_gid);
     __u32 cns_gid = pgid ? *pgid : 3004;
@@ -153,7 +175,7 @@ int cns_connect6(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 6. 记录原始 IPv6 目标地址
+    // 7. 记录原始 IPv6 目标地址
     __u64 cookie = bpf_get_socket_cookie(ctx);
     struct orig_dst_val dst = {};
     dst.family = 10; // AF_INET6
@@ -164,7 +186,7 @@ int cns_connect6(struct bpf_sock_addr *ctx) {
     dst.ip6[3] = ctx->user_ip6[3];
     bpf_map_update_elem(&cookie_dst_map, &cookie, &dst, BPF_ANY);
 
-    // 7. 重定向至 [::1]:proxy_port
+    // 8. 重定向至 [::1]:proxy_port
     ctx->user_ip6[0] = 0;
     ctx->user_ip6[1] = 0;
     ctx->user_ip6[2] = 0;

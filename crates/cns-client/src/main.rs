@@ -348,7 +348,8 @@ async fn main() -> anyhow::Result<()> {
             .rsplit_once(':')
             .and_then(|(_, port_str)| port_str.parse::<u16>().ok())
             .unwrap_or(0);
-        match EbpfManager::load_and_attach(&cgroup_dir, p, g, srv_port) {
+        let my_pid = std::process::id();
+        match EbpfManager::load_and_attach(&cgroup_dir, p, g, srv_port, my_pid) {
             Ok(mgr) => {
                 info!("eBPF mode initialized successfully on {cgroup_dir:?}");
                 Some(Arc::new(mgr))

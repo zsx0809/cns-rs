@@ -643,7 +643,7 @@ run_tests() {
     # 2. HTTP（明文 TCP 走隧道）
     printf "● [2/4] HTTP (TCP 80) ..... "
     C=$(probe2 "http://connect.rom.miui.com/generate_204" "http://www.google.com/generate_204" 5)
-    case "$C" in 204|200|302) echo "✓ $C";; skip) echo "skip (无 curl)";; *) echo "× ($C)";; esac
+    case "$C" in 204|200|302|304) echo "✓ $C";; skip) echo "skip (无 curl)";; *) echo "× ($C)";; esac
 
     # 3. HTTPS（TLS 隧道）
     printf "● [3/4] HTTPS (TLS 443) ... "

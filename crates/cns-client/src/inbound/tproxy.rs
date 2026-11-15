@@ -102,7 +102,10 @@ pub fn get_original_dst_with_ebpf(
                         return Ok(addr);
                     }
                     Err(e) => {
-                        trace!("eBPF map lookup miss for {peer}: {e}");
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("eBPF map lookup failed for peer {peer}: {e}"),
+                        ));
                     }
                 }
             } else {
