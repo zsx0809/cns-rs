@@ -52,6 +52,31 @@ def get_github_token():
     return None
 
 def api_request(url, token):
+    # 优先使用 curl 通过本地 socks5 (127.0.0.1:1080) 请求
+    cmd = [
+        "curl", "-s", "-w", "\n%{http_code}",
+        "-x", "socks5h://127.0.0.1:1080",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "User-Agent: cns-rs-ci-watch",
+    ]
+    if token:
+        cmd.extend(["-H", f"Authorization: Bearer {token}"])
+    cmd.append(url)
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        out = res.stdout
+        lines = out.rsplit(b"\n", 1)
+        if len(lines) == 2:
+            body, code_str = lines
+            try:
+                code = int(code_str.strip())
+                return code, body
+            except ValueError:
+                pass
+    except Exception:
+        pass
+
+    # 回退到 urllib
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("User-Agent", "cns-rs-ci-watch")
@@ -136,28 +161,23 @@ def main():
     download_url = target_art["archive_download_url"]
     print(f"[*] 正在下载产物: {target_art['name']} ({target_art.get('size_in_bytes', 0) // 1024} KB)...")
 
-    class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-            if new_req and "Authorization" in new_req.headers:
-                del new_req.headers["Authorization"]
-            return new_req
-
-    opener = urllib.request.build_opener(NoAuthRedirectHandler())
-    req = urllib.request.Request(download_url)
-    req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("User-Agent", "cns-rs-ci-watch")
-    req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with opener.open(req, timeout=60) as resp:
-            zip_bytes = resp.read()
-    except Exception as e:
-        print(f"[-] 下载产物失败: {e}")
+    os.makedirs("dist", exist_ok=True)
+    dl_cmd = [
+        "curl", "-sL",
+        "-x", "socks5h://127.0.0.1:1080",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "User-Agent: cns-rs-ci-watch",
+        "-H", f"Authorization: Bearer {token}",
+        download_url,
+        "-o", "dist/dist.zip"
+    ]
+    res = subprocess.run(dl_cmd)
+    if res.returncode != 0 or not os.path.exists("dist/dist.zip") or os.path.getsize("dist/dist.zip") == 0:
+        print("[-] 下载产物失败")
         sys.exit(1)
 
     # 解压到 dist/
-    os.makedirs("dist", exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+    with zipfile.ZipFile("dist/dist.zip") as z:
         z.extractall("dist")
 
     # 赋予执行权限
