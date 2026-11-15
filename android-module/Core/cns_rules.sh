@@ -514,6 +514,101 @@ sanitize_table() {
     fi
 }
 
+# 彻底清理残留的 CNS eBPF 程序（防异常退出时内核残留导致断网）
+clean_ebpf() {
+    _py=""
+    if command -v python3 >/dev/null 2>&1; then
+        _py="python3"
+    elif [ -x "/data/data/com.termux/files/usr/bin/python3" ]; then
+        _py="/data/data/com.termux/files/usr/bin/python3"
+    fi
+
+    if [ -n "$_py" ]; then
+        "$_py" -c '
+import ctypes, os
+SYS_bpf = 280
+BPF_PROG_QUERY = 16
+BPF_PROG_DETACH = 9
+BPF_PROG_GET_FD_BY_ID = 13
+BPF_OBJ_GET_INFO_BY_FD = 15
+
+libc = ctypes.CDLL(None)
+
+class BpfQueryAttr(ctypes.Structure):
+    _fields_ = [
+        ("target_fd", ctypes.c_uint32),
+        ("attach_type", ctypes.c_uint32),
+        ("query_flags", ctypes.c_uint32),
+        ("attach_flags", ctypes.c_uint32),
+        ("prog_ids", ctypes.c_uint64),
+        ("prog_cnt", ctypes.c_uint32),
+    ]
+
+class BpfDetachAttr(ctypes.Structure):
+    _fields_ = [
+        ("target_fd", ctypes.c_uint32),
+        ("attach_bpf_fd", ctypes.c_uint32),
+        ("attach_type", ctypes.c_uint32),
+    ]
+
+class BpfGetFdAttr(ctypes.Structure):
+    _fields_ = [("prog_id", ctypes.c_uint32), ("next_id", ctypes.c_uint32), ("open_flags", ctypes.c_uint32)]
+
+class BpfProgInfo(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_uint32), ("id", ctypes.c_uint32), ("tag", ctypes.c_uint8 * 8),
+        ("jited_prog_len", ctypes.c_uint32), ("xlated_prog_len", ctypes.c_uint32),
+        ("jited_prog_insns", ctypes.c_uint64), ("xlated_prog_insns", ctypes.c_uint64),
+        ("load_time", ctypes.c_uint64), ("created_by_uid", ctypes.c_uint32),
+        ("nr_map_ids", ctypes.c_uint32), ("map_ids", ctypes.c_uint64),
+        ("name", ctypes.c_char * 16),
+    ]
+
+class BpfInfoAttr(ctypes.Structure):
+    _fields_ = [("bpf_fd", ctypes.c_uint32), ("info_len", ctypes.c_uint32), ("info", ctypes.c_uint64)]
+
+for cgroup_path in ["/sys/fs/cgroup", "/sys/fs/cgroup/unified"]:
+    if not os.path.exists(cgroup_path):
+        continue
+    try:
+        cg_fd = os.open(cgroup_path, os.O_RDONLY)
+    except Exception:
+        continue
+
+    prog_ids = (ctypes.c_uint32 * 32)()
+    for atype in [3, 8, 9, 10, 11]:
+        qattr = BpfQueryAttr()
+        qattr.target_fd = cg_fd
+        qattr.attach_type = atype
+        qattr.prog_cnt = 32
+        qattr.prog_ids = ctypes.addressof(prog_ids)
+        if libc.syscall(SYS_bpf, BPF_PROG_QUERY, ctypes.byref(qattr), ctypes.sizeof(qattr)) == 0:
+            for i in range(qattr.prog_cnt):
+                pid = prog_ids[i]
+                gattr = BpfGetFdAttr()
+                gattr.prog_id = pid
+                pfd = libc.syscall(SYS_bpf, BPF_PROG_GET_FD_BY_ID, ctypes.byref(gattr), ctypes.sizeof(gattr))
+                if pfd >= 0:
+                    info = BpfProgInfo()
+                    iat = BpfInfoAttr()
+                    iat.bpf_fd = pfd
+                    iat.info_len = ctypes.sizeof(info)
+                    iat.info = ctypes.addressof(info)
+                    if libc.syscall(SYS_bpf, BPF_OBJ_GET_INFO_BY_FD, ctypes.byref(iat), ctypes.sizeof(iat)) == 0:
+                        name = info.name.decode("latin1", errors="ignore").strip("\x00")
+                        if "cgroup_connect" in name or "sockops" in name or "cns_" in name:
+                            dattr = BpfDetachAttr()
+                            dattr.target_fd = cg_fd
+                            dattr.attach_bpf_fd = pfd
+                            dattr.attach_type = atype
+                            libc.syscall(SYS_bpf, BPF_PROG_DETACH, ctypes.byref(dattr), ctypes.sizeof(dattr))
+                            print(f"   ✓ 已解除残留 eBPF 挂载: {name} (ID: {pid})")
+                    os.close(pfd)
+    os.close(cg_fd)
+' 2>/dev/null || true
+    fi
+}
+
 stop_rules() {
     echo "🛑 关闭免流模式并还原网络..."
 
@@ -576,6 +671,9 @@ stop_rules() {
     pkill -9 -x cns-client 2>/dev/null || true
     killall -9 cns-client 2>/dev/null || true
     rm -f client.pid
+
+    # 5. 清理残留 eBPF 挂载（防强杀导致内核孤儿挂载拦截断网）
+    clean_ebpf
 
     echo "✓ 分流规则与后台进程已彻底还原，网络恢复系统直连。"
     if [ "$modeName" = "CX" ]; then
