@@ -1,7 +1,8 @@
 use clap::Parser;
 use cns_client::config::ClientConfig;
+use cns_client::ebpf::EbpfManager;
 use cns_client::inbound::{
-    apply_process_gid, get_original_dst_with_mode, register_associate, LocalDnsRelay,
+    apply_process_gid, get_original_dst_with_ebpf, register_associate, LocalDnsRelay,
     Socks5Command, Socks5Handshake, TproxyMode, UdpAssociates, UdpRelay, UdpTproxyRelay,
 };
 use cns_client::outbound::CnsClientTunnel;
@@ -134,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mode = match args.mode.as_deref() {
         Some(raw) => TproxyMode::parse(raw).ok_or_else(|| {
-            anyhow::anyhow!("invalid --mode '{raw}' (expected redirect|tproxy|auto)")
+            anyhow::anyhow!("invalid --mode '{raw}' (expected redirect|tproxy|ebpf|auto)")
         })?,
         None => config.tproxy_mode_parsed(),
     };
@@ -331,7 +332,31 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ---- 3. 启动各 inbound ----
+    // ---- 3. 初始化 eBPF（若处于 ebpf 模式）----
+    let ebpf_mgr: Option<Arc<EbpfManager>> = if mode == TproxyMode::Ebpf {
+        let cgroup_dir = if std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+            || std::path::Path::new("/sys/fs/cgroup").is_dir()
+        {
+            std::path::PathBuf::from("/sys/fs/cgroup")
+        } else {
+            std::path::PathBuf::from("/sys/fs/cgroup/unified")
+        };
+        let p = tproxy_port.unwrap_or(7750);
+        let g = target_gid.unwrap_or(3004);
+        match EbpfManager::load_and_attach(&cgroup_dir, p, g) {
+            Ok(mgr) => {
+                info!("eBPF mode initialized successfully on {cgroup_dir:?}");
+                Some(Arc::new(mgr))
+            }
+            Err(e) => {
+                anyhow::bail!("failed to initialize eBPF mode: {e}");
+            }
+        }
+    } else {
+        None
+    };
+
+    // ---- 4. 启动各 inbound ----
     if let Some(listener) = socks5_listener {
         let sem = Arc::clone(&semaphore);
         let st = Arc::clone(&stats);
@@ -374,7 +399,15 @@ async fn main() -> anyhow::Result<()> {
             // 每个监听器共享同一个底层池（BufferPool 内部是 Arc）
             pool: pool.clone(),
         };
-        handles.push(tokio::spawn(run_tproxy_listener(listener, port, mode, rt, sem, shutdown)));
+        handles.push(tokio::spawn(run_tproxy_listener(
+            listener,
+            port,
+            mode,
+            ebpf_mgr.clone(),
+            rt,
+            sem,
+            shutdown,
+        )));
     }
 
     for (sock, port) in udp_tproxy_sockets {
@@ -453,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
     for h in handles {
         h.abort();
     }
+    drop(ebpf_mgr);
 
     if let Some(ref pid_path) = args.pid_file {
         let _ = fs::remove_file(pid_path);
@@ -567,6 +601,7 @@ async fn run_tproxy_listener(
     listener: TcpListener,
     listen_port: u16,
     mode: TproxyMode,
+    ebpf_mgr: Option<Arc<EbpfManager>>,
     rt: Runtime,
     semaphore: Arc<Semaphore>,
     shutdown: Arc<Notify>,
@@ -590,12 +625,18 @@ async fn run_tproxy_listener(
                 };
 
                 let session_rt = rt.clone();
+                let session_ebpf = ebpf_mgr.clone();
                 rt.stats.active.fetch_add(1, Ordering::Relaxed);
 
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _guard = ActiveGuard(Arc::clone(&session_rt.stats));
-                    match get_original_dst_with_mode(&stream, listen_port, mode) {
+                    match get_original_dst_with_ebpf(
+                        &stream,
+                        listen_port,
+                        mode,
+                        session_ebpf.as_deref(),
+                    ) {
                         Ok(target_addr) => {
                             session_rt.stats.tproxy_tcp.fetch_add(1, Ordering::Relaxed);
 

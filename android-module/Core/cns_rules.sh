@@ -32,8 +32,8 @@ bd_whitelist="${bd_whitelist:-}"
 TPORT_OVERRIDE="${tproxy_port:-}"
 allowWifi="${allowWifi:-1}"
 allowApps="${allowApps:-}"
-# 劫持模式固定为 redirect（Android 内核原生支持最稳）
-tproxy_mode="redirect"
+# 劫持模式：ebpf（最强双栈零 iptables 拦截） | redirect（传统 iptables NAT 兼容模式）
+tproxy_mode="${tproxy_mode:-ebpf}"
 # 是否拦截 QUIC（UDP 443）：1=拦截（促使回退 TCP TLS），0=放行
 blockQuic="${blockQuic:-1}"
 # 是否放行本机 DNS（有些 ROM 的 netd 走 127.0.0.1:53，被劫持会解析全挂）
@@ -232,8 +232,11 @@ quic_policy() {
 preflight_check() {
     _bad=0
 
-    # ---- 1) 劫持方式：统一采用内核原生稳定的 REDIRECT 模式 ----
-    tproxy_mode="redirect"
+    # ---- 1) 劫持方式：ebpf（最强双栈零 iptables）或 redirect（传统兼容）----
+    case "$tproxy_mode" in
+        ebpf|bpf) tproxy_mode="ebpf" ;;
+        *)        tproxy_mode="redirect" ;;
+    esac
 
     # ---- 2) 透明代理端口：脚本/规则实际用的 $tproxy_port vs JSON tproxy_listen ----
     _jlp=$(port_of "$(json_get "$CONF" tproxy_listen)")
@@ -393,56 +396,60 @@ start_rules() {
     echo "✓ cns-client 已就绪 (PID: $PID)"
 
     echo "⚙️ 注入分流规则..."
-    echo "   模式: REDIRECT (NAT 重定向)"
-    for tool in $TOOLS; do
-        $tool -w -t nat -N CNS_NAT 2>/dev/null
-        $tool -w -t nat -F CNS_NAT
+    if [ "$tproxy_mode" = "ebpf" ]; then
+        echo "   模式: eBPF (内核 cgroup 系统调用层双栈零 iptables 拦截)"
+    else
+        echo "   模式: REDIRECT (NAT 重定向)"
+        for tool in $TOOLS; do
+            $tool -w -t nat -N CNS_NAT 2>/dev/null
+            $tool -w -t nat -F CNS_NAT
 
-        # 1. 防回环：本进程组 / 回环口
-        add "$tool" nat CNS_NAT -m owner --gid-owner "$GID_OWNER" -j RETURN
-        add "$tool" nat CNS_NAT -o lo -j RETURN
-        [ "$protectLocalDns" = "1" ] && add "$tool" nat CNS_NAT -d 127.0.0.0/8 -j RETURN
-        add "$tool" nat CNS_NAT -p udp --dport 67:68 -j RETURN
+            # 1. 防回环：本进程组 / 回环口
+            add "$tool" nat CNS_NAT -m owner --gid-owner "$GID_OWNER" -j RETURN
+            add "$tool" nat CNS_NAT -o lo -j RETURN
+            [ "$protectLocalDns" = "1" ] && add "$tool" nat CNS_NAT -d 127.0.0.0/8 -j RETURN
+            add "$tool" nat CNS_NAT -p udp --dport 67:68 -j RETURN
 
-        # 2. 放行 CNS 服务端本身
-        add "$tool" nat CNS_NAT -p tcp --dport "$SERVER_PORT" -j RETURN
-        for ip in $SERVER_IPS; do
-            case "$ip" in
-                *:*) [ "$tool" = "ip6tables" ] && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
-                *)   [ "$tool" = "iptables" ]  && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
-            esac
+            # 2. 放行 CNS 服务端本身
+            add "$tool" nat CNS_NAT -p tcp --dport "$SERVER_PORT" -j RETURN
+            for ip in $SERVER_IPS; do
+                case "$ip" in
+                    *:*) [ "$tool" = "ip6tables" ] && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
+                    *)   [ "$tool" = "iptables" ]  && add "$tool" nat CNS_NAT -d "$ip" -p tcp -j RETURN ;;
+                esac
+            done
+
+            # 3. 放行代理自己的监听端口，避免自连
+            add "$tool" nat CNS_NAT -p tcp --dport "$tproxy_port" -j RETURN
+            add "$tool" nat CNS_NAT -p udp --dport "$DNS_PORT" -j RETURN
+            [ -n "$SOCKS_PORT" ] && add "$tool" nat CNS_NAT -p tcp --dport "$SOCKS_PORT" -j RETURN
+
+            # 4. WiFi 放行
+            [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o wlan+ -j RETURN
+            [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o p2p+ -j RETURN
+            [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o ap+ -j RETURN
+
+            # 5. 放行指定 App
+            for app in $allowApps; do
+                [ -z "$app" ] && continue
+                case "$app" in
+                    *[!0-9]*)
+                        uid=$(cmd package list packages -U 2>/dev/null | grep -F "$app" | grep -oE 'uid: [0-9]+' | awk '{print $2}' | head -n 1)
+                        [ -n "$uid" ] && add "$tool" nat CNS_NAT -m owner --uid-owner "$uid" -j RETURN
+                        ;;
+                    *)
+                        add "$tool" nat CNS_NAT -m owner --uid-owner "$app" -j RETURN
+                        ;;
+                esac
+            done
+
+            # 6. DNS 53 直连放行（核心铁律：防 Android rp_filter 丢包与源地址错乱）与 TCP REDIRECT 拦截
+            add "$tool" nat CNS_NAT -p udp --dport 53 -j RETURN
+            add "$tool" nat CNS_NAT -p tcp --dport 53 -j RETURN
+            add "$tool" nat CNS_NAT -p tcp -j REDIRECT --to-ports "$tproxy_port"
+            add "$tool" nat OUTPUT -j CNS_NAT
         done
-
-        # 3. 放行代理自己的监听端口，避免自连
-        add "$tool" nat CNS_NAT -p tcp --dport "$tproxy_port" -j RETURN
-        add "$tool" nat CNS_NAT -p udp --dport "$DNS_PORT" -j RETURN
-        [ -n "$SOCKS_PORT" ] && add "$tool" nat CNS_NAT -p tcp --dport "$SOCKS_PORT" -j RETURN
-
-        # 4. WiFi 放行
-        [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o wlan+ -j RETURN
-        [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o p2p+ -j RETURN
-        [ "$allowWifi" = "1" ] && add "$tool" nat CNS_NAT -o ap+ -j RETURN
-
-        # 5. 放行指定 App
-        for app in $allowApps; do
-            [ -z "$app" ] && continue
-            case "$app" in
-                *[!0-9]*)
-                    uid=$(cmd package list packages -U 2>/dev/null | grep -F "$app" | grep -oE 'uid: [0-9]+' | awk '{print $2}' | head -n 1)
-                    [ -n "$uid" ] && add "$tool" nat CNS_NAT -m owner --uid-owner "$uid" -j RETURN
-                    ;;
-                *)
-                    add "$tool" nat CNS_NAT -m owner --uid-owner "$app" -j RETURN
-                    ;;
-            esac
-        done
-
-        # 6. DNS 53 直连放行（核心铁律：防 Android rp_filter 丢包与源地址错乱）与 TCP REDIRECT 拦截
-        add "$tool" nat CNS_NAT -p udp --dport 53 -j RETURN
-        add "$tool" nat CNS_NAT -p tcp --dport 53 -j RETURN
-        add "$tool" nat CNS_NAT -p tcp -j REDIRECT --to-ports "$tproxy_port"
-        add "$tool" nat OUTPUT -j CNS_NAT
-    done
+    fi
 
     # 8. QUIC：拦截 UDP 443（必须用 REJECT 快速促退，严禁 DROP 导致浏览器卡死死等超时）
     _quic=$(quic_policy)
@@ -459,8 +466,8 @@ start_rules() {
             ;;
     esac
 
-    # 8.1 IPv6 快速促退（REDIRECT 模式走 IPv4 nat 表，v6 促退使双栈 App 瞬间回退 IPv4 TCP 走免流隧道）
-    if [ "$HAS_V6_FILTER" = "1" ]; then
+    # 8.1 IPv6 快速促退（仅在 REDIRECT 模式下启用；eBPF 模式原生支持双栈代理，无需也不应促退）
+    if [ "$tproxy_mode" = "redirect" ] && [ "$HAS_V6_FILTER" = "1" ]; then
         echo "🚧 IPv6 快速促退: 启用 (0ms REJECT 促使双栈 App 瞬间回退 IPv4)"
         ip6tables -w -N CNS_V6_OUT 2>/dev/null || true
         ip6tables -w -F CNS_V6_OUT 2>/dev/null || true
@@ -475,6 +482,8 @@ start_rules() {
         ip6tables -w -A CNS_V6_OUT -j REJECT --reject-with icmp6-port-unreachable
         del_all ip6tables filter OUTPUT -j CNS_V6_OUT
         add ip6tables filter OUTPUT -j CNS_V6_OUT
+    elif [ "$tproxy_mode" = "ebpf" ]; then
+        echo "🌐 IPv6 代理转发: 启用 (eBPF 双栈内核系统调用层原生透明代理)"
     fi
 
     # 9. MSS 钳制，避免跨国链路大包分片丢包
@@ -670,9 +679,10 @@ run_tests() {
     echo "🎉 检测完毕。"
 }
 
-# status / test 用：模式固定为 redirect
+# status / test 用：解析模式
 resolve_mode_soft() {
-    tproxy_mode="redirect"
+    [ -n "$tproxy_mode" ] && return 0
+    tproxy_mode="ebpf"
     return 0
 }
 

@@ -25,6 +25,8 @@ pub enum TproxyMode {
     Tproxy,
     /// 先试 SO_ORIGINAL_DST，失败再用 local_addr（兼容混合规则）
     Auto,
+    /// eBPF cgroup connect4/connect6 拦截：查 BPF Map 取原始目标
+    Ebpf,
 }
 
 impl TproxyMode {
@@ -32,6 +34,7 @@ impl TproxyMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "redirect" => Some(Self::Redirect),
             "tproxy" => Some(Self::Tproxy),
+            "ebpf" | "bpf" => Some(Self::Ebpf),
             "auto" | "" => Some(Self::Auto),
             _ => None,
         }
@@ -42,6 +45,7 @@ impl TproxyMode {
             Self::Redirect => "redirect",
             Self::Tproxy => "tproxy",
             Self::Auto => "auto",
+            Self::Ebpf => "ebpf",
         }
     }
 }
@@ -70,9 +74,44 @@ pub fn get_original_dst_with_mode(
     listen_port: u16,
     mode: TproxyMode,
 ) -> io::Result<SocketAddr> {
+    get_original_dst_with_ebpf(stream, listen_port, mode, None)
+}
+
+pub fn get_original_dst_with_ebpf(
+    stream: &TcpStream,
+    listen_port: u16,
+    mode: TproxyMode,
+    ebpf: Option<&crate::ebpf::EbpfManager>,
+) -> io::Result<SocketAddr> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let fd = stream.as_raw_fd();
+
+        // 0. eBPF 模式：优先查 BPF Map
+        if mode == TproxyMode::Ebpf {
+            if let Some(mgr) = ebpf {
+                let peer = stream.peer_addr()?;
+                match mgr.lookup_orig_dst(peer) {
+                    Ok(addr) => {
+                        if is_loopback_self(addr, listen_port) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("eBPF map returned own listen port {listen_port}"),
+                            ));
+                        }
+                        return Ok(addr);
+                    }
+                    Err(e) => {
+                        trace!("eBPF map lookup miss for {peer}: {e}");
+                    }
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "eBPF manager not initialized for ebpf mode",
+                ));
+            }
+        }
 
         // 1. TPROXY+IP_TRANSPARENT：local_addr 就是原始目标，优先级最高
         if mode == TproxyMode::Tproxy {
@@ -148,7 +187,7 @@ pub fn get_original_dst_with_mode(
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        let _ = (listen_port, mode);
+        let _ = (listen_port, mode, ebpf);
         stream.peer_addr()
     }
 }
@@ -652,10 +691,13 @@ mod tests {
     fn mode_parsing() {
         assert_eq!(TproxyMode::parse("redirect"), Some(TproxyMode::Redirect));
         assert_eq!(TproxyMode::parse("TPROXY"), Some(TproxyMode::Tproxy));
+        assert_eq!(TproxyMode::parse("ebpf"), Some(TproxyMode::Ebpf));
+        assert_eq!(TproxyMode::parse("BPF"), Some(TproxyMode::Ebpf));
         assert_eq!(TproxyMode::parse(" auto "), Some(TproxyMode::Auto));
         assert_eq!(TproxyMode::parse(""), Some(TproxyMode::Auto));
         assert_eq!(TproxyMode::parse("magic"), None);
         assert_eq!(TproxyMode::Tproxy.as_str(), "tproxy");
+        assert_eq!(TproxyMode::Ebpf.as_str(), "ebpf");
     }
 
     #[tokio::test]

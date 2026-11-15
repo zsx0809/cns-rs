@@ -33,14 +33,16 @@ KernelSU / APatch 可在模块列表点【操作 / Action】一键开关。
 > 中文文件名在个别终端 + `su -c` 引号嵌套下编码不稳，因此同时提供 ASCII 别名
 > `start.sh` / `stop.sh` / `status.sh`，内容与中文名脚本完全等价。
 
-## 劫持方式（专注于最稳定的 REDIRECT 模式）
+## 劫持方式（双轨并行：现代 eBPF 与 原生 REDIRECT）
 
 | 模式 | 实现方式 | 说明 |
 | :--- | :--- | :--- |
-| `redirect`（唯一固定） | 内核原生 `nat` 表 `REDIRECT` | 彻底移除脆弱的 TPROXY 策略路由体系，Android 原生支持最稳，零回环死锁 |
+| `ebpf`（默认推荐） | 内核 `cgroup/connect` + `sockops` 双栈零 iptables 拦截 | 现代化 eBPF 系统调用层拦截，原生支持 IPv4 + IPv6 双栈，零 iptables 表依赖，零策略路由冲突，性能最佳 |
+| `redirect`（兼容模式） | 内核原生 `nat` 表 `REDIRECT` | 经典成熟模式，Android 内核普遍支持；IPv6 走 0ms 快速促退回退 IPv4 |
 
 > **设计决策**：
-> 早期曾尝试支持 TPROXY 策略路由以劫持本机出站。实测在 Android 宿主环境下，本机 App 出站经策略路由回环至 lo 极易与 Android 系统 Netd 服务的 fwmark 产生位冲突，且入站回包容易被 PREROUTING 误判重复劫持，导致 TCP 三次握手无法完成（HTTP/HTTPS 全网断流）。因此，本模块彻底移除了复杂的 TPROXY 策略路由，专注于 Linux/Android 内核最成熟、最可靠的 NAT REDIRECT 模式。
+> 1. **为什么引入 eBPF？** 在很多现代 Android GKI 内核中，未编译 `ip6table_nat` 导致 IPv6 无法通过 iptables 做 REDIRECT。通过在 cgroup 的 `connect4`/`connect6` 及 `sockops` 上挂载精简 eBPF 钩子，直接在系统调用层面改写目的地址并用 BPF Map 精准还原真实目标，彻底终结了 IPv6 无法拦截的难题，实现真正的双栈免流与代理。
+> 2. **为什么保留 REDIRECT？** 保持对旧版本内核（Linux 4.19 以前或缺少 BTF 的老旧 ROM）的 100% 兼容。用户只需在 `config.ini` 中配置 `tproxy_mode='redirect'` 即可一键退回传统模式。
 
 ## 防回环与 DNS 直连放行机制
 
