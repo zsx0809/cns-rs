@@ -64,6 +64,10 @@ struct Args {
     #[arg(long = "outbound-mode")]
     outbound_mode: Option<String>,
 
+    /// 覆盖 eBPF cgroup v2 挂载路径（默认自动检测）
+    #[arg(long = "cgroup-path")]
+    cgroup_path: Option<std::path::PathBuf>,
+
     /// 覆盖百度专属白名单域名（如 wx.tenpay.com）
     #[arg(long = "bd-whitelist")]
     bd_whitelist: Option<String>,
@@ -334,12 +338,15 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- 3. 初始化 eBPF（若处于 ebpf 模式）----
     let ebpf_mgr: Option<Arc<EbpfManager>> = if mode == TproxyMode::Ebpf {
-        let cgroup_dir = if std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
-            || std::path::Path::new("/sys/fs/cgroup").is_dir()
-        {
-            std::path::PathBuf::from("/sys/fs/cgroup")
-        } else {
-            std::path::PathBuf::from("/sys/fs/cgroup/unified")
+        let user_override = args
+            .cgroup_path
+            .as_deref()
+            .or_else(|| config.cgroup_path.as_deref().map(std::path::Path::new));
+        let cgroup_dir = match EbpfManager::detect_cgroup_v2_path(user_override) {
+            Ok(p) => p,
+            Err(e) => {
+                anyhow::bail!("failed to resolve cgroup v2 path for eBPF mode: {e}");
+            }
         };
         let p = tproxy_port.unwrap_or(7750);
         let g = target_gid.unwrap_or(3004);

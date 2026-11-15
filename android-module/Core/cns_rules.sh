@@ -567,9 +567,23 @@ class BpfProgInfo(ctypes.Structure):
 class BpfInfoAttr(ctypes.Structure):
     _fields_ = [("bpf_fd", ctypes.c_uint32), ("info_len", ctypes.c_uint32), ("info", ctypes.c_uint64)]
 
-for cgroup_path in ["/sys/fs/cgroup", "/sys/fs/cgroup/unified"]:
-    if not os.path.exists(cgroup_path):
-        continue
+cgroups = []
+if os.path.exists("/proc/mounts"):
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == "cgroup2":
+                    if os.path.isdir(parts[1]):
+                        cgroups.append(parts[1])
+    except Exception:
+        pass
+
+for p in ["/sys/fs/cgroup", "/sys/fs/cgroup/unified", "/dev/cgroup2"]:
+    if os.path.isdir(p) and p not in cgroups:
+        cgroups.append(p)
+
+for cgroup_path in cgroups:
     try:
         cg_fd = os.open(cgroup_path, os.O_RDONLY)
     except Exception:

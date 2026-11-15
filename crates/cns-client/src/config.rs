@@ -90,9 +90,13 @@ pub struct ClientConfig {
     #[serde(default = "default_session_max_age")]
     pub session_max_age_seconds: u64,
 
-    /// 透明代理劫持方式：`redirect`（iptables REDIRECT）/ `tproxy`（TPROXY+IP_TRANSPARENT）/ `auto`
+    /// 透明代理劫持方式：`redirect`（iptables REDIRECT）/ `tproxy`（TPROXY+IP_TRANSPARENT）/ `ebpf` / `auto`
     #[serde(default = "default_tproxy_mode")]
     pub tproxy_mode: String,
+
+    /// eBPF cgroup v2 挂载路径（留空则自动检测）
+    #[serde(default)]
+    pub cgroup_path: Option<String>,
 
     /// SOCKS5 UDP relay 的监听地址；空串 = 自动复用 socks5_listen 的端口（推荐，
     /// 因为 SOCKS5 回复里的 BND.PORT 必须与 App 实际发送 UDP 的端口一致）
@@ -186,6 +190,7 @@ impl Default for ClientConfig {
             max_inflight_per_tunnel: default_max_inflight(),
             session_max_age_seconds: default_session_max_age(),
             tproxy_mode: default_tproxy_mode(),
+            cgroup_path: None,
             socks5_udp_listen: String::new(),
             buffer_pool_cap: default_pool_cap(),
             tun_mtu: 0,

@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
-use tracing::{error, info};
+use std::path::{Path, PathBuf};
+use tracing::{error, info, warn};
 
 pub static CNS_BPF_ELF: &[u8] = include_bytes!("../../bpf/cns_sockops.o");
 
@@ -102,6 +102,94 @@ pub struct EbpfManager {
 }
 
 impl EbpfManager {
+    /// 自动探测并返回系统有效的 cgroup v2 挂载路径
+    ///
+    /// 优先级规则：
+    /// 1. 用户显式指定的覆盖路径 (CLI 参数 --cgroup-path 或配置项 cgroup_path)
+    /// 2. 解析 /proc/mounts 寻找 fstype 为 "cgroup2" 的真实挂载点
+    /// 3. 解析 /proc/self/mountinfo 寻找 cgroup2 挂载点
+    /// 4. 常见候选路径逐一探测（检查特征文件 cgroup.controllers / cgroup.procs）
+    pub fn detect_cgroup_v2_path(user_override: Option<&Path>) -> io::Result<PathBuf> {
+        // 1. 用户显式指定
+        if let Some(path) = user_override {
+            if path.is_dir() {
+                info!("using user-specified cgroup v2 path: {path:?}");
+                return Ok(path.to_path_buf());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("specified cgroup path does not exist or is not a directory: {path:?}"),
+            ));
+        }
+
+        // 2. 从 /proc/mounts 动态解析 cgroup2 真实挂载点
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            for line in mounts.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 && parts[2] == "cgroup2" {
+                    let mount_point = PathBuf::from(parts[1]);
+                    if mount_point.is_dir() {
+                        info!("auto-detected cgroup2 mount point from /proc/mounts: {mount_point:?}");
+                        return Ok(mount_point);
+                    }
+                }
+            }
+        }
+
+        // 3. 从 /proc/self/mountinfo 进一步解析
+        if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+            for line in mountinfo.lines() {
+                if let Some((_, rest)) = line.split_once(" - ") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if !parts.is_empty() && parts[0] == "cgroup2" {
+                        let pre_parts: Vec<&str> = line.split_whitespace().collect();
+                        if pre_parts.len() >= 5 {
+                            let mount_point = PathBuf::from(pre_parts[4]);
+                            if mount_point.is_dir() {
+                                info!("auto-detected cgroup2 mount point from /proc/self/mountinfo: {mount_point:?}");
+                                return Ok(mount_point);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. 常见候选路径探测
+        let candidates = [
+            "/sys/fs/cgroup",
+            "/sys/fs/cgroup/unified",
+            "/dev/cgroup2",
+            "/sys/fs/cgroup/cgroup2",
+        ];
+
+        for c in &candidates {
+            let p = Path::new(c);
+            if p.is_dir() {
+                if p.join("cgroup.controllers").exists() || p.join("cgroup.procs").exists() {
+                    info!("auto-detected cgroup v2 feature in candidate path: {p:?}");
+                    return Ok(p.to_path_buf());
+                }
+            }
+        }
+
+        // 兜底：候选目录如果存在
+        for c in &candidates {
+            let p = Path::new(c);
+            if p.is_dir() {
+                warn!("cgroup v2 controller files not found, falling back to existing directory: {p:?}");
+                return Ok(p.to_path_buf());
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "failed to detect any valid cgroup v2 mount point. \
+             Please ensure your kernel has CONFIG_CGROUP_BPF=y and cgroup2 is mounted, \
+             or specify --cgroup-path manually.",
+        ))
+    }
+
     /// 加载 eBPF 模块并 attach 到指定 cgroup
     pub fn load_and_attach(
         cgroup_path: &Path,
@@ -607,5 +695,31 @@ impl Drop for EbpfManager {
             self.tuple_dst_map_fd,
         ]);
         info!("eBPF programs detached and fds cleaned up");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_cgroup_v2_path() {
+        // 用户显式指定不存在的目录应返回错误
+        let non_exist = Path::new("/non/existent/path/for/cgroup");
+        assert!(EbpfManager::detect_cgroup_v2_path(Some(non_exist)).is_err());
+
+        // 用户显式指定有效目录应直接返回
+        let cur_dir = Path::new("/sys");
+        if cur_dir.is_dir() {
+            assert_eq!(
+                EbpfManager::detect_cgroup_v2_path(Some(cur_dir)).unwrap(),
+                cur_dir
+            );
+        }
+
+        // 自动探测逻辑在支持 cgroup v2 的环境应成功返回目录
+        if let Ok(path) = EbpfManager::detect_cgroup_v2_path(None) {
+            assert!(path.is_dir(), "detected cgroup path must be a directory");
+        }
     }
 }
