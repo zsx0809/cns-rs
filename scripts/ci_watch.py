@@ -136,9 +136,23 @@ def main():
     download_url = target_art["archive_download_url"]
     print(f"[*] 正在下载产物: {target_art['name']} ({target_art.get('size_in_bytes', 0) // 1024} KB)...")
 
-    code, zip_bytes = api_request(download_url, token)
-    if code != 200:
-        print(f"[-] 下载产物失败 (HTTP {code})")
+    class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new_req and "Authorization" in new_req.headers:
+                del new_req.headers["Authorization"]
+            return new_req
+
+    opener = urllib.request.build_opener(NoAuthRedirectHandler())
+    req = urllib.request.Request(download_url)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "cns-rs-ci-watch")
+    req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with opener.open(req, timeout=60) as resp:
+            zip_bytes = resp.read()
+    except Exception as e:
+        print(f"[-] 下载产物失败: {e}")
         sys.exit(1)
 
     # 解压到 dist/
