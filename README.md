@@ -20,7 +20,7 @@
 | :--- | :--- | :--- | :--- |
 | 运行模型 | Go GC + 每连接 goroutine | Tokio 单线程调度、无 GC 抖动 | 语言层事实 |
 | 转发热路径 | 每包一次日志/拷贝 | 原位异或 + 32KB 缓冲池复用（`BufferPool`） | `cns-core::transport::pump` |
-| 代理入口 | TUN 虚拟网卡（用户态拷贝） | **原生 REDIRECT 模式**（v4 内核 NAT 重定向，DNS 53 直连放行，IPv6 0ms 促退） | 见「分流与防回环机制」 |
+| 代理入口 | TUN 虚拟网卡（用户态拷贝） | **双模可选：eBPF 内核双栈透明代理**（无需 `ip6table_nat` 与 TUN） / **原生 REDIRECT 模式**（经典兼容） | 见「分流与防回环机制」 |
 | DNS 隧道 | 每个查询新建一条 TCP 连接并完整握手 | **隧道复用 + 本地缓存**，一条连接跑并发查询 | `cns-client::outbound::mux` |
 | DNS 上游 | 由客户端随意指定 | 服务端配置为权威 + 客户端可选沿用 App 原始目标 | `dns_mode: orig\|fixed` |
 | 半关闭 | `try_join!`：单向 EOF 掐断另一向 | `join!` + 显式 `shutdown`，SSH/HTTPS banner 不丢 | `pump.rs` 有回归测试 |
@@ -102,6 +102,20 @@ Android 内核严格校验 DNS 回包源地址，非 `orig_dst` 的回包会被�
 * `TCP_FASTOPEN_CONNECT`：客户端出站首写携带 SYN 数据（旧版只在服务端开了 TFO，客户端从未使用，所谓 0-RTT 只是宣传）；
 * 隧道空闲超时后自动回收并在下一次查询时重建；驱动任务退出时立即让所有在途请求失败，不干等到超时；
 * DNS 竞速（`dns_upstream` 多上游）带硬超时并 abort 落败方，不再悬挂 fd。
+
+### 6. eBPF 双栈透明代理（Android 内核无 ip6table_nat 方案）
+Android GKI 内核默认没有编译 `ip6table_nat`（没有 IPv6 NAT 表），导致传统的 `iptables -t nat -j REDIRECT` 只能拦截 IPv4，无法拦截 IPv6（旧版本只能开启 `block_ipv6` 强制 0ms 快速促退回 IPv4）。
+
+`cns-rs` 在保持对经典 `redirect` 模式 100% 兼容的同时，引入了**原生零依赖 eBPF 双栈透明代理**：
+* **拦截点**：在内核 cgroup v2 挂载点附加 `cgroup/connect4` 与 `cgroup/connect6`，在用户空间调用 `connect()` 系统调用时捕获真实目的地址，并将连接篡改重定向至本地代理端口（`127.0.0.1:7750` / `[::1]:7750`）；
+* **原始目标提取**：通过 `sockops` 的 `BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB` 事件将客户端源端口四元组与原始目标地址关联，代理端以微秒级自旋重试从 BPF LRU Hash Map 中查出真实目的地址；
+* **防回环自连**：采用内核 `bpf_get_current_pid_tgid() >> 32` 匹配进程 TGID（PID）与 `server_port` 白名单机制，无惧 Android Bionic 多线程下 `setgid` 不跨线程广播的系统缺陷，100% 杜绝自连死锁；
+* **零外部 C 库依赖**：客户端使用纯 Rust 实现 ELF 字节码解析、重定位与系统调用加载，不依赖 `libbpf`，单二进制独立运行；
+* **优雅解挂与网络还原**：模块退出时除通过 Rust `Drop` 自动 detach 外，`cns_rules.sh stop` 关闭脚本内嵌原生 eBPF 解除挂载机制，精准清理残留 BPF 程序并保护系统自带的 netd 计数程序。
+
+**切换方法**：
+* 配置文件 `config.ini`：设置 `tproxy_mode='ebpf'`；
+* 模式文件 `modes/*.json`：设置 `"tproxy_mode": "ebpf"` 并将 `"block_ipv6": false`（释放原生双栈上网能力）。若内核不支持 eBPF，可随时切回 `tproxy_mode='redirect'`。
 
 ---
 
