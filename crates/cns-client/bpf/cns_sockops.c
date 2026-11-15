@@ -97,7 +97,12 @@ int cns_connect4(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 5. 放行自身 PID (TGID) 进程流量（无视多线程 setgid 差异，100% 免疫回环）
+    // 5. 本地回环地址 (127.0.0.0/8) 直连放行（放行本地服务如 DeepSeek Harness、Termux WebUI 等）
+    if ((bpf_ntohl(ctx->user_ip4) >> 24) == 127) {
+        return 1;
+    }
+
+    // 6. 放行自身 PID (TGID) 进程流量（无视多线程 setgid 差异，100% 免疫回环）
     __u32 k_pid = 3;
     __u32 *ppid = bpf_map_lookup_elem(&cns_config_map, &k_pid);
     if (ppid && *ppid != 0) {
@@ -156,7 +161,18 @@ int cns_connect6(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 5. 放行自身 PID (TGID) 进程流量（无视多线程 setgid 差异，100% 免疫回环）
+    // 5. IPv6 本地回环 (::1) 直连放行
+    if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
+        ctx->user_ip6[2] == 0 && ctx->user_ip6[3] == bpf_htonl(1)) {
+        return 1;
+    }
+
+    // 6. IPv6 链路本地 (fe80::/10) 直连放行
+    if ((bpf_ntohl(ctx->user_ip6[0]) & 0xFFC00000) == 0xFE800000) {
+        return 1;
+    }
+
+    // 7. 放行自身 PID (TGID) 进程流量（无视多线程 setgid 差异，100% 免疫回环）
     __u32 k_pid = 3;
     __u32 *ppid = bpf_map_lookup_elem(&cns_config_map, &k_pid);
     if (ppid && *ppid != 0) {
