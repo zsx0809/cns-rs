@@ -43,8 +43,9 @@ struct client_tuple_key {
 };
 
 // Config map:
-// key 0 -> proxy_port (__u32)
-// key 1 -> proxy_gid  (__u32)
+// key 0 -> proxy_port  (__u32)
+// key 1 -> proxy_gid   (__u32)
+// key 2 -> server_port (__u32)
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 4);
@@ -70,7 +71,31 @@ struct {
 
 SEC("cgroup/connect4")
 int cns_connect4(struct bpf_sock_addr *ctx) {
-    // 1. 放行自身 GID 流量
+    // 1. 读取本地代理端口与服务端端口
+    __u32 k_port = 0;
+    __u32 *pport = bpf_map_lookup_elem(&cns_config_map, &k_port);
+    __u16 proxy_port = pport ? (__u16)*pport : 7750;
+
+    __u32 k_srv = 2;
+    __u32 *psrv = bpf_map_lookup_elem(&cns_config_map, &k_srv);
+    __u16 server_port = psrv ? (__u16)*psrv : 0;
+
+    // 2. 服务端端口直连放行（防死循环自连，放行健康检测）
+    if (server_port != 0 && ctx->user_port == bpf_htons(server_port)) {
+        return 1;
+    }
+
+    // 3. 代理自身监听端口放行（防二次拦截）
+    if (ctx->user_port == bpf_htons(proxy_port)) {
+        return 1;
+    }
+
+    // 4. DNS (53) 直连放行铁律
+    if (ctx->user_port == bpf_htons(53)) {
+        return 1;
+    }
+
+    // 5. 放行自身 GID 流量
     __u32 k_gid = 1;
     __u32 *pgid = bpf_map_lookup_elem(&cns_config_map, &k_gid);
     __u32 cns_gid = pgid ? *pgid : 3004;
@@ -79,22 +104,7 @@ int cns_connect4(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 2. DNS (53) 直连放行铁律
-    if (ctx->user_port == bpf_htons(53)) {
-        return 1;
-    }
-
-    // 3. 读取本地代理端口
-    __u32 k_port = 0;
-    __u32 *pport = bpf_map_lookup_elem(&cns_config_map, &k_port);
-    __u16 proxy_port = pport ? (__u16)*pport : 7750;
-
-    // 4. 防回环：若目标已经是 127.0.0.1 且端口为代理端口则直接放行
-    if (ctx->user_ip4 == 0x0100007f && ctx->user_port == bpf_htons(proxy_port)) {
-        return 1;
-    }
-
-    // 5. 记录原始目标地址
+    // 6. 记录原始目标地址
     __u64 cookie = bpf_get_socket_cookie(ctx);
     struct orig_dst_val dst = {};
     dst.family = 2; // AF_INET
@@ -102,7 +112,7 @@ int cns_connect4(struct bpf_sock_addr *ctx) {
     dst.ip4 = ctx->user_ip4;
     bpf_map_update_elem(&cookie_dst_map, &cookie, &dst, BPF_ANY);
 
-    // 6. 重定向至 127.0.0.1:proxy_port
+    // 7. 重定向至 127.0.0.1:proxy_port
     ctx->user_ip4 = 0x0100007f;
     ctx->user_port = bpf_htons(proxy_port);
     return 1;
@@ -110,7 +120,31 @@ int cns_connect4(struct bpf_sock_addr *ctx) {
 
 SEC("cgroup/connect6")
 int cns_connect6(struct bpf_sock_addr *ctx) {
-    // 1. 放行自身 GID 流量
+    // 1. 读取本地代理端口与服务端端口
+    __u32 k_port = 0;
+    __u32 *pport = bpf_map_lookup_elem(&cns_config_map, &k_port);
+    __u16 proxy_port = pport ? (__u16)*pport : 7750;
+
+    __u32 k_srv = 2;
+    __u32 *psrv = bpf_map_lookup_elem(&cns_config_map, &k_srv);
+    __u16 server_port = psrv ? (__u16)*psrv : 0;
+
+    // 2. 服务端端口直连放行（防死循环自连，放行健康检测）
+    if (server_port != 0 && ctx->user_port == bpf_htons(server_port)) {
+        return 1;
+    }
+
+    // 3. 代理自身监听端口放行（防二次拦截）
+    if (ctx->user_port == bpf_htons(proxy_port)) {
+        return 1;
+    }
+
+    // 4. DNS (53) 直连放行
+    if (ctx->user_port == bpf_htons(53)) {
+        return 1;
+    }
+
+    // 5. 放行自身 GID 流量
     __u32 k_gid = 1;
     __u32 *pgid = bpf_map_lookup_elem(&cns_config_map, &k_gid);
     __u32 cns_gid = pgid ? *pgid : 3004;
@@ -119,24 +153,7 @@ int cns_connect6(struct bpf_sock_addr *ctx) {
         return 1;
     }
 
-    // 2. DNS (53) 直连放行
-    if (ctx->user_port == bpf_htons(53)) {
-        return 1;
-    }
-
-    // 3. 读取本地代理端口
-    __u32 k_port = 0;
-    __u32 *pport = bpf_map_lookup_elem(&cns_config_map, &k_port);
-    __u16 proxy_port = pport ? (__u16)*pport : 7750;
-
-    // 4. 防回环：若目标已经是 ::1 且端口为代理端口则直接放行
-    if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
-        ctx->user_ip6[2] == 0 && ctx->user_ip6[3] == bpf_htonl(1) &&
-        ctx->user_port == bpf_htons(proxy_port)) {
-        return 1;
-    }
-
-    // 5. 记录原始 IPv6 目标地址
+    // 6. 记录原始 IPv6 目标地址
     __u64 cookie = bpf_get_socket_cookie(ctx);
     struct orig_dst_val dst = {};
     dst.family = 10; // AF_INET6
@@ -147,7 +164,7 @@ int cns_connect6(struct bpf_sock_addr *ctx) {
     dst.ip6[3] = ctx->user_ip6[3];
     bpf_map_update_elem(&cookie_dst_map, &cookie, &dst, BPF_ANY);
 
-    // 6. 重定向至 [::1]:proxy_port
+    // 7. 重定向至 [::1]:proxy_port
     ctx->user_ip6[0] = 0;
     ctx->user_ip6[1] = 0;
     ctx->user_ip6[2] = 0;
@@ -175,7 +192,6 @@ int cns_sockops(struct bpf_sock_ops *skops) {
     if (skops->family == 2) { // AF_INET
         tuple.ip4 = skops->local_ip4;
     } else if (skops->family == 10) { // AF_INET6
-        // 使用 volatile 单独读取，防止 clang 对 ctx 指针做优化加法运算
         __u32 w0 = skops->local_ip6[0];
         __u32 w1 = skops->local_ip6[1];
         __u32 w2 = skops->local_ip6[2];

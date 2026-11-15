@@ -343,7 +343,12 @@ async fn main() -> anyhow::Result<()> {
         };
         let p = tproxy_port.unwrap_or(7750);
         let g = target_gid.unwrap_or(3004);
-        match EbpfManager::load_and_attach(&cgroup_dir, p, g) {
+        let srv_port = config
+            .cns_server
+            .rsplit_once(':')
+            .and_then(|(_, port_str)| port_str.parse::<u16>().ok())
+            .unwrap_or(0);
+        match EbpfManager::load_and_attach(&cgroup_dir, p, g, srv_port) {
             Ok(mgr) => {
                 info!("eBPF mode initialized successfully on {cgroup_dir:?}");
                 Some(Arc::new(mgr))

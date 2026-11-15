@@ -107,6 +107,7 @@ impl EbpfManager {
         cgroup_path: &Path,
         proxy_port: u16,
         proxy_gid: u32,
+        server_port: u16,
     ) -> io::Result<Self> {
         let elf = CNS_BPF_ELF;
         let cgroup_file = File::open(cgroup_path)?;
@@ -127,6 +128,10 @@ impl EbpfManager {
         let k_gid: u32 = 1;
         let v_gid: u32 = proxy_gid;
         Self::map_update(cfg_map_fd, &k_gid, &v_gid)?;
+
+        let k_srv: u32 = 2;
+        let v_srv: u32 = server_port as u32;
+        Self::map_update(cfg_map_fd, &k_srv, &v_srv)?;
 
         // 2. 解析 ELF、重定位并加载各程序
         let mut map_table = std::collections::HashMap::new();
@@ -229,7 +234,7 @@ impl EbpfManager {
         std::mem::forget(cgroup_file);
 
         info!(
-            "eBPF transparent proxy attached to {:?} (proxy_port={proxy_port}, gid={proxy_gid})",
+            "eBPF transparent proxy attached to {:?} (proxy_port={proxy_port}, gid={proxy_gid}, server_port={server_port})",
             cgroup_path
         );
 
